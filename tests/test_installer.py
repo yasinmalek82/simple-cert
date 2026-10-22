@@ -62,7 +62,7 @@ def test_install_and_reinstall_preserve_private_state(tmp_path):
         module.install_file(ROOT / "simple_cert.py", prefix)
         result = subprocess.run([str(prefix / "bin/simple-cert"), "--version"], capture_output=True)
         assert result.returncode == 0
-        assert result.stdout.strip() == b"simple-cert 0.1.2"
+        assert result.stdout.strip() == b"simple-cert 0.1.3"
         result = subprocess.run(
             [str(prefix / "bin/simple-cert"), "--state-dir", str(state)],
             input=b"2\n0\n",

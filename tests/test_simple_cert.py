@@ -376,3 +376,55 @@ def test_interactive_error_is_readable_before_redraw(app, tmp_path, monkeypatch,
     output = capsys.readouterr().out
     assert "Error: Example safe failure" in output
     assert output.count("\033[2J\033[H") == 2
+
+
+def test_selected_certificate_viewer_shows_both_files(manager, app, pair, monkeypatch, capsys):
+    record = manager.issue(["example.com"])
+    capsys.readouterr()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setenv("TERM", "xterm")
+    values = iter(["1", "", "2", "yes", "", "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(values))
+    assert hasattr(app, "certificate_menu"), "Certificate file viewer is not implemented yet"
+    app.certificate_menu(manager, record)
+    output = capsys.readouterr().out
+    assert (pair / "fullchain.pem").read_text().strip() in output
+    assert (pair / "key.pem").read_text().strip() in output
+
+
+@pytest.mark.parametrize("terminal, consent", [(True, ""), (True, "no"), (False, "yes")])
+def test_private_key_requires_terminal_and_explicit_consent(
+    manager, app, pair, monkeypatch, capsys, terminal, consent
+):
+    record = manager.issue(["example.com"])
+    capsys.readouterr()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: terminal)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: terminal)
+    monkeypatch.setattr("builtins.input", lambda _: consent)
+    assert hasattr(app, "display_file"), "Certificate file viewer is not implemented yet"
+    try:
+        app.display_file(manager, record, "key.pem")
+    except app.Error:
+        pass
+    assert (pair / "key.pem").read_text().strip() not in capsys.readouterr().out
+
+
+def test_list_selection_opens_certificate_viewer(manager, app, monkeypatch, capsys):
+    manager.issue(["example.com"])
+    capsys.readouterr()
+    values = iter(["2", "1", "1", "0", "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(values))
+    app.menu(manager)
+    assert "-----BEGIN CERTIFICATE-----" in capsys.readouterr().out
+
+
+def test_file_viewer_cannot_read_settings_or_missing_files(manager, app, monkeypatch):
+    record = manager.issue(["example.com"])
+    assert hasattr(app, "display_file"), "Certificate file viewer is not implemented yet"
+    with pytest.raises(app.Error):
+        app.display_file(manager, record, "../../settings.json")
+    folder = manager.root / "certificates" / record["id"] / "current"
+    (folder / "fullchain.pem").unlink()
+    with pytest.raises(app.Error, match="published"):
+        app.display_file(manager, record, "fullchain.pem")

@@ -18,7 +18,7 @@ import uuid
 import warnings
 from pathlib import Path
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 ACME_COMMIT = "3688b094adffc1a52d3b994c586cd97caa2f0b85"
 CA = "https://acme-v02.api.letsencrypt.org/directory"
 MENU = """
@@ -424,13 +424,61 @@ def show(manager, record):
         print("Local files only. Copy them to the destination service when needed.")
 
 
+def clear_screen():
+    interactive = (
+        sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM", "") not in ("", "dumb")
+    )
+    if interactive:
+        print("\033[2J\033[H", end="", flush=True)
+    return interactive
+
+
+def display_file(manager, record, filename):
+    if filename not in ("fullchain.pem", "key.pem") or not re.fullmatch(r"[a-f0-9]{24}", record["id"]):
+        raise Error("Invalid certificate file selection.")
+    if filename == "key.pem":
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise Error("Private keys can only be displayed in an interactive terminal, without redirection.")
+        print("This displays the private key on your terminal. Do not share it or record this session.")
+        if input("Display private key? Type yes: ").strip().lower() != "yes":
+            print("Private key display cancelled.")
+            return
+    with locked(manager.root):
+        folder = manager.root / "certificates" / record["id"]
+        try:
+            path = (folder / "current" / filename).resolve(strict=True)
+            path.relative_to((folder / "versions").resolve())
+            if path.stat().st_size > 1024 * 1024:
+                raise ValueError
+            contents = path.read_text(encoding="ascii")
+        except (OSError, ValueError):
+            raise Error("No readable published certificate file is available for this selection.") from None
+    print(f"\n--- {filename} ---")
+    print(contents.rstrip())
+    print(f"--- End of {filename} ---")
+
+
+def certificate_menu(manager, record):
+    while True:
+        interactive = clear_screen()
+        show(manager, record)
+        print("\n1. View fullchain.pem\n2. View key.pem (private)\n0. Back to main menu")
+        choice = input("Choose file [0-2]: ").strip()
+        if choice == "0":
+            return
+        try:
+            if choice not in ("1", "2"):
+                raise Error("Invalid file selection.")
+            display_file(manager, record, "fullchain.pem" if choice == "1" else "key.pem")
+        except Error as error:
+            print(f"\nError: {error}")
+        if interactive:
+            input("Press Enter to return to certificate details...")
+
+
 def menu(manager):
     while True:
-        interactive = (
-            sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM", "") not in ("", "dumb")
-        )
-        if interactive:
-            print("\033[2J\033[H", end="", flush=True)
+        interactive = clear_screen()
         print(MENU)
         try:
             choice = input("Choose [0-4]: ").strip()
@@ -462,16 +510,18 @@ def menu(manager):
                         print(
                             f"{index}. {', '.join(record['domains'])} | {record.get('expires_at', 'not issued')} | {record['operation']}"
                         )
-                        if choice == "2":
-                            show(manager, record)
-                    if choice == "3":
-                        selection = input("Certificate number (0 to cancel): ").strip()
-                        if selection == "0":
-                            continue
-                        if not selection.isdigit() or not 1 <= int(selection) <= len(records):
-                            raise Error("Invalid certificate number.")
+                    selection = input("Certificate number (0 to cancel): ").strip()
+                    if selection == "0":
+                        continue
+                    if not selection.isdigit() or not 1 <= int(selection) <= len(records):
+                        raise Error("Invalid certificate number.")
+                    selected = records[int(selection) - 1]
+                    if choice == "2":
+                        certificate_menu(manager, selected)
+                        continue
+                    else:
                         print("The ACME client renews only when due; no forced renewal is performed.")
-                        show(manager, manager.renew(records[int(selection) - 1]["id"]))
+                        show(manager, manager.renew(selected["id"]))
             else:
                 print("Invalid choice. Choose a number from 0 to 4.")
         except Error as error:

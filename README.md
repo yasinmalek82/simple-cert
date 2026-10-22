@@ -5,7 +5,7 @@ Get a Let's Encrypt certificate through Cloudflare DNS, even when your domain po
 **Quick install** — Ubuntu 22.04 or newer (including 26.04/26.10), or Debian 12/13, on the mother server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.2/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.3/install.sh | sudo bash
 ```
 
 Then open the interactive menu:
@@ -65,6 +65,15 @@ Renewal is **manual**. Choose option 3 periodically; acme.sh decides whether the
 The tool does not force unnecessary renewals. A failed initial request remains in the list and can
 be retried through option 3. A duplicate domain set is directed to renewal instead of another issue.
 There are no cron jobs, systemd timers, panel API calls, service reloads or node operations.
+
+To view file contents, choose **2**, select a certificate by its number, then choose
+**View fullchain.pem** or **View key.pem**. The viewer shows the selected certificate's published
+files and returns to certificate details after Enter. Choose **0** to return to the main menu.
+Copy only the PEM block between the `BEGIN` and `END` markers, including those markers.
+
+Private keys require both an interactive input/output terminal and an explicit `yes` confirmation;
+they cannot be displayed through redirected output. Viewing a key leaves it in terminal scrollback,
+so use a private, unrecorded session. No file contents are added to application state or logs.
 
 ## Files and privacy
 
