@@ -20,7 +20,7 @@ import uuid
 import warnings
 from pathlib import Path
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 REPOSITORY = "yasinmalek82/simple-cert"
 LEGACY_RELEASES = {
     "57f5f5b583dd558ac4f52d23eba9d425b03229e34f07a2227a6590c88fe504a1": "0.1.0",
@@ -30,8 +30,8 @@ LEGACY_RELEASES = {
 }
 ACME_COMMIT = "3688b094adffc1a52d3b994c586cd97caa2f0b85"
 CA = "https://acme-v02.api.letsencrypt.org/directory"
-MENU = """
-  SIMPLE CERT
+MENU = f"""
+  SIMPLE CERT v{VERSION}
   Cloudflare DNS verification | Let's Encrypt
   ------------------------------------------------
   1. Issue certificate
