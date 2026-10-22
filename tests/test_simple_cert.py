@@ -3,6 +3,7 @@
 import datetime as dt
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -428,3 +429,186 @@ def test_file_viewer_cannot_read_settings_or_missing_files(manager, app, monkeyp
     (folder / "fullchain.pem").unlink()
     with pytest.raises(app.Error, match="published"):
         app.display_file(manager, record, "fullchain.pem")
+
+
+@pytest.fixture
+def panel(app, tmp_path, monkeypatch):
+    assert hasattr(app, "docker_panels"), "Panel delivery is not implemented yet"
+    data = tmp_path / "panel-data"
+    data.mkdir()
+    raw = {
+        "Id": "fixture-panel",
+        "Name": "/mother",
+        "State": {"Running": True},
+        "Config": {
+            "Image": "pasarguard/panel:fixture",
+            "Env": ["DATA_DIR=/panel-data", "API_KEY=private-fixture"],
+        },
+        "HostConfig": {"UsernsMode": ""},
+        "Mounts": [{"Type": "bind", "Source": str(data), "Destination": "/panel-data", "RW": True}],
+    }
+    target = app.docker_panels([raw])[0]
+    monkeypatch.setattr(app, "discover_panels", lambda: [target])
+    real_run = app.run
+
+    def boundary(argv, **kwargs):
+        if argv[0] == "openssl":
+            return real_run(argv, **kwargs)
+        if argv[:2] == ["docker", "info"]:
+            return subprocess.CompletedProcess(argv, 0, b"[]", b"")
+        assert argv[:3] == ["docker", "exec", "fixture-panel"]
+        if "geteuid" in argv[5]:
+            output = f"{os.geteuid()}:{os.getegid()}".encode()
+        else:
+            files = [data / Path(path).relative_to("/panel-data") for path in argv[6:]]
+            import hashlib
+
+            output = " ".join(hashlib.sha256(path.read_bytes()).hexdigest() for path in files).encode()
+        return subprocess.CompletedProcess(argv, 0, output, b"")
+
+    monkeypatch.setattr(app, "run", boundary)
+    return target, data
+
+
+def test_panel_discovery_ignores_nodes_and_never_retains_credentials(app, panel):
+    target, _ = panel
+    assert "private-fixture" not in json.dumps(target)
+    assert app.docker_panels([{"Config": {"Image": "pasarguard/node:latest"}}]) == []
+
+
+def test_delivery_publishes_mapped_paths_and_private_matching_files(manager, app, panel, pair):
+    target, data = panel
+    record = manager.issue(["example.com"])
+    directory = "/panel-data/certs/simple-cert/" + record["id"]
+    result = app.publish_delivery(manager, record, target, directory)
+    current = data / "certs/simple-cert" / record["id"] / "current"
+    assert current.is_symlink()
+    assert (current / "fullchain.pem").read_bytes() == (pair / "fullchain.pem").read_bytes()
+    assert (current / "key.pem").stat().st_mode & 0o777 == 0o600
+    assert result["deliveries"][0]["status"] == "complete"
+    assert result["deliveries"][0]["directory"] == directory
+
+
+def test_nested_readonly_mount_and_traversal_are_blocked(app, panel):
+    target, _ = panel
+    target["mounts"].append(
+        {"Source": "/unrelated", "Destination": "/panel-data/certs", "Type": "bind", "RW": False}
+    )
+    with pytest.raises(app.Error):
+        app.panel_location(target, "/panel-data/certs/example")
+    with pytest.raises(app.Error):
+        app.panel_location(target, "/panel-data/../outside")
+
+
+def test_delivery_cancel_does_not_create_destination(manager, app, panel, monkeypatch):
+    target, data = panel
+    record = manager.issue(["example.com"])
+    values = iter(["", "no"])
+    monkeypatch.setattr("builtins.input", lambda _: next(values))
+    app.delivery_menu(manager, record, [target])
+    assert not (data / "certs").exists()
+
+
+def test_new_delivery_path_retains_previous_managed_path(manager, app, panel):
+    target, data = panel
+    record = manager.issue(["example.com"])
+    app.publish_delivery(manager, record, target, "/panel-data/certs/first")
+    record = app.publish_delivery(manager, record, target, "/panel-data/certs/second")
+    assert len(record["deliveries"]) == 2
+    assert (data / "certs/first/current/key.pem").is_file()
+    assert (data / "certs/second/current/key.pem").is_file()
+
+
+def test_renewal_refreshes_registered_delivery(manager, app, panel):
+    target, data = panel
+    record = manager.issue(["example.com"])
+    app.publish_delivery(manager, record, target, "/panel-data/certs/selected")
+    current = data / "certs/selected/current"
+    previous = current.resolve()
+    result = manager.renew(record["id"])
+    assert current.resolve() != previous
+    assert previous.is_dir()
+    assert result["deliveries"][0]["status"] == "complete"
+
+
+def test_failed_delivery_keeps_previous_pair_and_marks_pending(manager, app, panel, monkeypatch):
+    target, data = panel
+    record = manager.issue(["example.com"])
+    app.publish_delivery(manager, record, target, "/panel-data/certs/selected")
+    current = data / "certs/selected/current"
+    previous = current.resolve()
+
+    def unreadable(*args):
+        raise app.Error("Fixture reader unavailable")
+
+    monkeypatch.setattr(app, "panel_reader_check", unreadable)
+    result = manager.renew(record["id"])
+    assert current.resolve() == previous
+    assert result["operation"] == "complete"
+    assert result["deliveries"][0]["status"] == "pending"
+
+
+def test_unmanaged_directory_and_symlink_are_never_overwritten(manager, app, panel):
+    target, data = panel
+    record = manager.issue(["example.com"])
+    unknown = data / "existing"
+    unknown.mkdir()
+    (unknown / "key.pem").write_text("unrelated-key-marker")
+    with pytest.raises(app.Error):
+        app.publish_delivery(manager, record, target, "/panel-data/existing")
+    assert (unknown / "key.pem").read_text() == "unrelated-key-marker"
+    (data / "symlink").symlink_to(unknown)
+    with pytest.raises(app.Error):
+        app.publish_delivery(manager, record, target, "/panel-data/symlink/new")
+
+
+def test_issue_menu_offers_panel_delivery_after_success(manager, app, panel, monkeypatch):
+    seen = []
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(app, "clear_screen", lambda: False)
+    monkeypatch.setattr(app, "delivery_menu", lambda manager, record, targets: seen.append(record["id"]))
+    values = iter(["1", "example.com", "", "y", "y", "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(values))
+    app.menu(manager)
+    assert seen == [manager.records()[0]["id"]]
+
+
+def test_certificate_details_offer_later_publication(manager, app, monkeypatch):
+    record = manager.issue(["example.com"])
+    seen = []
+    monkeypatch.setattr(app, "delivery_menu", lambda manager, record: seen.append(record["id"]) or record)
+    values = iter(["3", "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(values))
+    app.certificate_menu(manager, record)
+    assert seen == [record["id"]]
+
+
+def test_mount_change_blocks_renewal_delivery_to_new_host(manager, app, panel, tmp_path):
+    target, data = panel
+    record = manager.issue(["example.com"])
+    app.publish_delivery(manager, record, target, "/panel-data/certs/selected")
+    other = tmp_path / "replacement-mount"
+    other.mkdir()
+    target["mounts"][0]["Source"] = str(other)
+    result = manager.renew(record["id"])
+    assert not (other / "certs").exists()
+    assert (data / "certs/selected/current/key.pem").is_file()
+    assert result["operation"] == "complete"
+    assert result["deliveries"][0]["status"] == "pending"
+
+
+def test_private_state_cannot_be_used_as_delivery_mount(manager, app, panel):
+    target, _ = panel
+    record = manager.issue(["example.com"])
+    target["mounts"][0]["Source"] = str(manager.root)
+    with pytest.raises(app.Error):
+        app.publish_delivery(manager, record, target, "/panel-data/delivery")
+    assert not (manager.root / "delivery").exists()
+
+
+@pytest.mark.parametrize("option", ["rootless", "userns"])
+def test_namespaced_docker_cannot_publish(manager, app, panel, monkeypatch, option):
+    target, _ = panel
+    monkeypatch.setattr(app, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, option.encode(), b""))
+    with pytest.raises(app.Error, match="rootful"):
+        app.panel_reader_identity(target)

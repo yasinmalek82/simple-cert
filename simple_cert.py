@@ -20,7 +20,7 @@ import uuid
 import warnings
 from pathlib import Path
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 REPOSITORY = "yasinmalek82/simple-cert"
 LEGACY_RELEASES = {
     "57f5f5b583dd558ac4f52d23eba9d425b03229e34f07a2227a6590c88fe504a1": "0.1.0",
@@ -363,7 +363,8 @@ class Manager:
             record = load(folder / "record.json")
             # A failed first issuance can be retried without pretending a certificate already exists.
             active = (folder / "current" / "fullchain.pem").is_file()
-            return self._obtain(record, folder, renew=record.get("issued", False) or active)
+            record = self._obtain(record, folder, renew=record.get("issued", False) or active)
+        return refresh_deliveries(self, record)
 
     def _obtain(self, record, folder, renew):
         record["operation"] = "renewing" if renew else "issuing"
@@ -404,6 +405,318 @@ class Manager:
             self.harden()
 
 
+def docker_panels(containers):
+    """Keep only the fields required to locate a running mother panel."""
+    result = []
+    for item in containers:
+        config = item.get("Config", {})
+        if not re.search(r"(?:^|/)pasarguard/panel(?:[:@]|$)", config.get("Image", "")):
+            continue
+        if not item.get("State", {}).get("Running"):
+            continue
+        data = next(
+            (value[9:] for value in config.get("Env", []) if value.startswith("DATA_DIR=")),
+            "/var/lib/pasarguard",
+        )
+        result.append(
+            {
+                "kind": "docker",
+                "id": item["Id"],
+                "name": item["Name"].lstrip("/"),
+                "data": data,
+                "userns": item.get("HostConfig", {}).get("UsernsMode", ""),
+                "mounts": [
+                    {key: mount.get(key) for key in ("Source", "Destination", "Type", "RW")}
+                    for mount in item.get("Mounts", [])
+                ],
+            }
+        )
+    return result
+
+
+def discover_panels():
+    """Inspect local Docker only; never expose inspect/environment output."""
+    try:
+        endpoint = os.environ.get("DOCKER_HOST")
+        if not endpoint:
+            contexts = json.loads(run(["docker", "context", "inspect"], timeout=15).stdout)
+            endpoint = contexts[0]["Endpoints"]["docker"]["Host"]
+        if not endpoint.startswith("unix://"):
+            return []
+        ids = run(["docker", "ps", "-q"], timeout=15).stdout.decode().split()
+        if not ids:
+            return []
+        return docker_panels(json.loads(run(["docker", "inspect", *ids], timeout=15).stdout))
+    except (Error, ValueError, KeyError, IndexError, TypeError):
+        return []
+
+
+def checked_path(value):
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts or path == Path("/"):
+        raise Error("Use an absolute directory inside the panel data directory, without '..'.")
+    return path
+
+
+def no_symlinks(path):
+    for part in [*reversed(path.parents), path]:
+        if part.is_symlink():
+            raise Error("Certificate delivery paths must not contain symbolic links.")
+
+
+def panel_location(target, directory):
+    path = checked_path(directory)
+    data = checked_path(target["data"])
+    if not path.is_relative_to(data) or path == data:
+        raise Error("Choose a subdirectory of the detected panel data directory.")
+    mounts = [
+        mount
+        for mount in target["mounts"]
+        if mount.get("Destination") and path.is_relative_to(Path(mount["Destination"]))
+    ]
+    if not mounts:
+        raise Error("The panel directory has no shared Docker mount.")
+    mount = max(mounts, key=lambda value: len(Path(value["Destination"]).parts))
+    if not mount["RW"] or mount["Type"] not in ("bind", "volume") or mount["Destination"] == "/":
+        raise Error("The panel needs a writable, dedicated data mount.")
+    host = checked_path(mount["Source"]) / path.relative_to(mount["Destination"])
+    no_symlinks(host)
+    # A nested mount may hide files below the selected publication directory.
+    if any(
+        Path(value["Destination"]).is_relative_to(path)
+        for value in target["mounts"]
+        if value.get("Destination")
+    ):
+        raise Error("Choose a directory without nested mounts inside it.")
+    return host
+
+
+def panel_reader_identity(target):
+    options = run(["docker", "info", "--format", "{{json .SecurityOptions}}"], timeout=15).stdout.decode()
+    if target["userns"] not in ("", "host") or "rootless" in options or "userns" in options:
+        raise Error("Automatic delivery requires local rootful Docker without user namespace remapping.")
+    output = (
+        run(
+            [
+                "docker",
+                "exec",
+                target["id"],
+                "python3",
+                "-c",
+                "import os; print(str(os.geteuid())+':'+str(os.getegid()))",
+            ],
+            timeout=15,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    if not re.fullmatch(r"[0-9]+:[0-9]+", output):
+        raise Error("Cannot identify the panel certificate reader.")
+    identity = tuple(int(value) for value in output.split(":"))
+    if any(value >= 2**32 - 1 for value in identity):
+        raise Error("Unsupported panel reader identity.")
+    return identity
+
+
+def panel_reader_check(target, host, directory):
+    names = ("fullchain.pem", "key.pem")
+    expected = " ".join(hashlib.sha256((host / name).read_bytes()).hexdigest() for name in names)
+    script = "import hashlib,sys; print(' '.join(hashlib.sha256(open(p,'rb').read()).hexdigest() for p in sys.argv[1:]))"
+    actual = (
+        run(
+            [
+                "docker",
+                "exec",
+                target["id"],
+                "python3",
+                "-c",
+                script,
+                *[str(Path(directory) / name) for name in names],
+            ],
+            timeout=15,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    if actual != expected:
+        raise Error("The panel could not read the matching certificate and key.")
+
+
+def delivery_parents(path):
+    """Create traversable parents without changing existing panel directories."""
+    missing = []
+    parent = path
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o711)
+        directory.chmod(0o711)
+
+
+def publish_delivery(manager, record, target, directory):
+    fresh = next(
+        (
+            item
+            for item in discover_panels()
+            if item["kind"] == target["kind"] and item["name"] == target["name"]
+        ),
+        None,
+    )
+    if fresh is None:
+        raise Error("The selected local PasarGuard panel is no longer available.")
+    host = panel_location(fresh, directory)
+    if host.is_relative_to(manager.root.resolve()) or manager.root.resolve().is_relative_to(host):
+        raise Error("Panel delivery must be separate from the private certificate state directory.")
+    uid, gid = panel_reader_identity(fresh)
+    with locked(manager.root):
+        record_path = manager.root / "certificates" / record["id"] / "record.json"
+        record = load(record_path)
+        source = record_path.parent / "current"
+        metadata = validate_pair(source, record["domains"])
+        marker = host / ".simple-cert-delivery.json"
+        if host.exists() and any(host.iterdir()):
+            if not marker.is_file() or marker.is_symlink() or load(marker).get("id") != record["id"]:
+                raise Error(
+                    "Destination is not an owned simple-cert delivery directory; choose an empty directory."
+                )
+        for name in ("versions", "current"):
+            path = host / name
+            if name == "versions" and path.is_symlink():
+                raise Error("Invalid delivery versions directory.")
+            if name == "current" and (path.exists() or path.is_symlink()):
+                if not path.is_symlink() or not re.fullmatch(r"versions/[a-f0-9]{32}", os.readlink(path)):
+                    raise Error("Invalid delivery current pointer.")
+        deliveries = record.setdefault("deliveries", [])
+        delivery = next(
+            (
+                item
+                for item in deliveries
+                if item["directory"] == directory
+                and item["name"] == fresh["name"]
+                and item["kind"] == fresh["kind"]
+            ),
+            None,
+        )
+        if delivery is None:
+            delivery = {
+                "kind": fresh["kind"],
+                "name": fresh["name"],
+                "directory": directory,
+                "host_directory": str(host),
+            }
+            deliveries.append(delivery)
+        elif delivery["host_directory"] != str(host):
+            raise Error("Panel mount changed. Select a new delivery directory explicitly.")
+        delivery["status"] = "pending"
+        save(record_path, record)
+        version = uuid.uuid4().hex
+        candidate = host / "versions" / version
+        link = host / (".current-" + version)
+        try:
+            delivery_parents(host.parent)
+            host.mkdir(mode=0o711, exist_ok=True)
+            # Only owned directories are changed; private PEMs remain readable by the panel UID.
+            host.chmod(0o711)
+            descriptor, temporary = tempfile.mkstemp(prefix=".marker-", dir=host)
+            try:
+                with os.fdopen(descriptor, "w") as stream:
+                    json.dump({"id": record["id"]}, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, marker)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+            (host / "versions").mkdir(mode=0o711, exist_ok=True)
+            candidate.mkdir(mode=0o700)
+            os.chown(candidate, uid, gid)
+            for name in ("fullchain.pem", "key.pem"):
+                destination = candidate / name
+                descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write((source / name).read_bytes())
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chown(destination, uid, gid)
+            validate_pair(candidate, record["domains"])
+            panel_candidate = str(Path(directory) / "versions" / version)
+            panel_reader_check(fresh, candidate, panel_candidate)
+            sync_dir(candidate)
+            link.symlink_to(Path("versions") / version)
+            os.replace(link, host / "current")
+            sync_dir(host)
+            panel_reader_check(fresh, host / "current", str(Path(directory) / "current"))
+            delivery.update(metadata)
+            delivery["status"] = "complete"
+            save(record_path, record)
+            return record
+        except (OSError, Error):
+            raise Error(
+                "Certificate remains saved locally. Panel delivery is pending; previous files are retained."
+            ) from None
+        finally:
+            link.unlink(missing_ok=True)
+
+
+def refresh_deliveries(manager, record):
+    for delivery in list(record.get("deliveries", [])):
+        try:
+            record = publish_delivery(manager, record, delivery, delivery["directory"])
+        except Error:
+            with locked(manager.root):
+                path = manager.root / "certificates" / record["id"] / "record.json"
+                record = load(path)
+                for saved in record.get("deliveries", []):
+                    if saved["directory"] == delivery["directory"] and saved["name"] == delivery["name"]:
+                        saved["status"] = "pending"
+                save(path, record)
+            print("Local renewal succeeded; a panel delivery is pending. Retry from certificate details.")
+    return record
+
+
+def delivery_menu(manager, record, targets=None):
+    targets = discover_panels() if targets is None else targets
+    if not targets:
+        print("No supported local PasarGuard Docker panel found. Local certificate files are retained.")
+        return record
+    target = targets[0]
+    if len(targets) > 1:
+        for index, item in enumerate(targets, 1):
+            print(f"{index}. {item['name']}")
+        choice = input("Panel number (0 to cancel): ").strip()
+        if choice == "0":
+            return record
+        if not choice.isdigit() or not 1 <= int(choice) <= len(targets):
+            raise Error("Invalid panel selection.")
+        target = targets[int(choice) - 1]
+    default = str(Path(target["data"]) / "certs" / "simple-cert" / record["id"])
+    print(f"Panel: {target['name']}")
+    directory = input(f"Certificate directory inside the panel [{default}]: ").strip() or default
+    host = panel_location(target, directory)
+    print(f"Host directory: {host}\nPanel directory: {directory}")
+    print("A managed copy is published. Local source and previous delivery paths are retained.")
+    if input("Publish certificate and private key here? Type yes: ").strip().lower() != "yes":
+        print("Panel delivery cancelled.")
+        return record
+    record = publish_delivery(manager, record, target, directory)
+    print("Panel reader verified. Enter these paths in the selected Core:")
+    print(f"Certificate file: {directory}/current/fullchain.pem\nKey file: {directory}/current/key.pem")
+    print("Serve on node: disabled. Core configuration and services have not been changed.")
+    return record
+
+
+def offer_panel_delivery(manager, record):
+    if not sys.stdin.isatty():
+        return
+    targets = discover_panels()
+    if (
+        targets
+        and input("Local PasarGuard found. Publish a certificate copy for the panel? [y/N]: ").strip().lower()
+        == "y"
+    ):
+        delivery_menu(manager, record, targets)
+
+
 def settings_menu(manager):
     if not sys.stdin.isatty():
         raise Error("Settings must be entered in an interactive terminal; tokens use hidden input.")
@@ -433,6 +746,10 @@ def show(manager, record):
     if (folder / "fullchain.pem").is_file():
         print(f"Full chain: {folder / 'fullchain.pem'}\nPrivate key: {folder / 'key.pem'}")
         print("Local files only. Copy them to the destination service when needed.")
+    for delivery in record.get("deliveries", []):
+        print(f"Panel {delivery['name']}: {delivery['status']}")
+        print(f"Certificate file: {delivery['directory']}/current/fullchain.pem")
+        print(f"Key file: {delivery['directory']}/current/key.pem")
 
 
 def clear_screen():
@@ -473,14 +790,19 @@ def certificate_menu(manager, record):
     while True:
         interactive = clear_screen()
         show(manager, record)
-        print("\n1. View fullchain.pem\n2. View key.pem (private)\n0. Back to main menu")
-        choice = input("Choose file [0-2]: ").strip()
+        print(
+            "\n1. View fullchain.pem\n2. View key.pem (private)\n3. Publish/change PasarGuard certificate path\n0. Back to main menu"
+        )
+        choice = input("Choose action [0-3]: ").strip()
         if choice == "0":
             return
         try:
-            if choice not in ("1", "2"):
+            if choice == "3":
+                record = delivery_menu(manager, record)
+            elif choice not in ("1", "2"):
                 raise Error("Invalid file selection.")
-            display_file(manager, record, "fullchain.pem" if choice == "1" else "key.pem")
+            else:
+                display_file(manager, record, "fullchain.pem" if choice == "1" else "key.pem")
         except Error as error:
             print(f"\nError: {error}")
         if interactive:
@@ -709,7 +1031,9 @@ def menu(manager):
                     input("Issue a public Let's Encrypt certificate for these names? [y/N]: ").strip().lower()
                     == "y"
                 ):
-                    show(manager, manager.issue(domains))
+                    issued = manager.issue(domains)
+                    show(manager, issued)
+                    offer_panel_delivery(manager, issued)
             elif choice in ("2", "3"):
                 records = manager.records()
                 if not records:

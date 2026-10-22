@@ -5,7 +5,7 @@ Get a Let's Encrypt certificate through Cloudflare DNS, even when your domain po
 **Quick install** — Ubuntu 22.04 or newer (including 26.04/26.10), or Debian 12/13, on the mother server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.4/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.5/install.sh | sudo bash
 ```
 
 Then open the interactive menu:
@@ -165,3 +165,43 @@ markers. Its default mode checks the real terminal uninstall flow without networ
 The manually dispatched `Maintenance acceptance` workflow additionally exercises a real public
 GitHub update as root into a temporary prefix, followed by uninstall; it never changes the runner's
 system installation or uses Cloudflare credentials.
+
+## PasarGuard master-side certificate delivery
+
+Run simple-cert on the **mother panel host**. After issuance, a detected local PasarGuard
+panel offers an optional delivery prompt. You can also use **2 → select certificate → 3**
+to publish later or choose another directory. Confirm the displayed host and panel paths
+by typing `yes`. The default directory inside the panel is:
+
+```text
+/var/lib/pasarguard/certs/simple-cert/<certificate-id>/current/fullchain.pem
+/var/lib/pasarguard/certs/simple-cert/<certificate-id>/current/key.pem
+```
+
+The detected `DATA_DIR` replaces `/var/lib/pasarguard` when configured. Paste the **panel
+paths** printed by the tool into the selected Core's Certificate file and Key file fields,
+with **Serve on node disabled**. The master reads the PEMs and supplies certificate material
+to the node; the Germany node does not need these file paths. This command only publishes
+files. It does not edit Core settings, restart services or prove live node TLS.
+
+Automatic detection supports running official `pasarguard/panel` Docker images on a local,
+rootful Docker daemon without user namespace remapping. A writable bind mount or named
+volume must cover the detected data directory. Remote Docker, native/systemd installations,
+custom images and inaccessible readers need manual file placement. Root is usually required
+on the host to set the panel reader's UID/GID. Docker must already be installed.
+
+The tool resolves the most specific mount, refuses symlink paths, read-only mounts and
+nonempty unmanaged directories, and verifies matching PEMs from inside the container using
+the panel's default user. Keys have mode `0600`; no world-readable private keys are created.
+This check assumes the panel processes use the container's configured default user.
+
+The private source is retained for renewal. Successful manual renewal refreshes every
+registered delivery destination. A failed reader check before publication keeps its previous
+certificate pair, records a pending delivery and leaves the local renewal intact. Retry via
+certificate details after correcting access. Selecting another directory retains earlier
+deliveries because an existing Core may still reference them. Uninstall also retains these
+files. Do not delete an older path until its Core references have been updated.
+
+Docker acceptance uses an isolated Python fixture container with the official image-name
+pattern and generated test certificates; it verifies real mounts, non-root file access and
+renewal publication. It does not run a production PasarGuard panel or issue real certificates.

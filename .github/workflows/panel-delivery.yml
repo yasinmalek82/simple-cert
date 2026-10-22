@@ -1,0 +1,12 @@
+name: Panel delivery acceptance
+on: [workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  docker-reader:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify real Docker mounts and non-root certificate reader with fixture container
+        run: sudo python3 tests/panel_delivery_acceptance.py
