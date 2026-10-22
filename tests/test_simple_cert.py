@@ -612,3 +612,69 @@ def test_namespaced_docker_cannot_publish(manager, app, panel, monkeypatch, opti
     monkeypatch.setattr(app, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, option.encode(), b""))
     with pytest.raises(app.Error, match="rootful"):
         app.panel_reader_identity(target)
+
+
+def test_new_certificate_folders_identify_domain_and_remain_renewable(manager, pair):
+    normal = manager.issue(["example.com"])
+    wildcard = manager.issue(["*.example.com"])
+    combined = manager.issue(["example.com", "*.example.com"])
+    assert normal["id"].startswith("example.com--")
+    assert wildcard["id"].startswith("wildcard.example.com--")
+    assert combined["id"].startswith("example.com--")
+    assert len({record["id"] for record in (normal, wildcard, combined)}) == 3
+    for record in (normal, wildcard, combined):
+        manager.renew(record["id"])
+        current = manager.root / "certificates" / record["id"] / "current"
+        assert (current / "fullchain.pem").read_bytes() == (pair / "fullchain.pem").read_bytes()
+    assert len(manager.records()) == 3
+
+
+def test_legacy_hashed_folder_stays_renewable_and_blocks_duplicate_issue(manager, app):
+    record = manager.issue(["example.com"])
+    import hashlib
+
+    legacy = hashlib.sha256(b"example.com").hexdigest()[:24]
+    old = manager.root / "certificates" / legacy
+    folder = manager.root / "certificates" / record["id"]
+    if folder != old:
+        folder.rename(old)
+    record["id"] = legacy
+    app.save(old / "record.json", record)
+    previous = (old / "current").resolve()
+    result = manager.renew(legacy)
+    assert result["id"] == legacy
+    assert (old / "current").resolve() != previous
+    assert previous.is_dir()
+    with pytest.raises(app.Error, match="already saved"):
+        manager.issue(["example.com"])
+    assert len(manager.records()) == 1
+
+
+def test_panel_default_for_existing_certificate_contains_domain(manager, app, panel, monkeypatch, capsys):
+    target, data = panel
+    record = manager.issue(["example.com"])
+    legacy = "a379a6f6eeafb9a55e378c11"
+    folder = manager.root / "certificates" / record["id"]
+    folder.rename(folder.parent / legacy)
+    record["id"] = legacy
+    app.save(folder.parent / legacy / "record.json", record)
+    values = iter(["", "yes"])
+    monkeypatch.setattr("builtins.input", lambda _: next(values))
+    result = app.delivery_menu(manager, record, [target])
+    directory = result["deliveries"][0]["directory"]
+    assert Path(directory).name.startswith("example.com--")
+    assert (data / Path(directory).relative_to("/panel-data") / "current/key.pem").is_file()
+    assert directory + "/current/fullchain.pem" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("identifier", ["../outside", "/etc/passwd", "example.com--../key", "..", "a" * 300])
+def test_folder_identifiers_cannot_escape_certificate_state(manager, app, identifier):
+    with pytest.raises(app.Error, match="Invalid certificate selection"):
+        manager.renew(identifier)
+
+
+def test_long_domain_folder_stays_within_filesystem_component_limit(app):
+    domain = ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 57])
+    name = app.certificate_identifier([domain])
+    assert len(name.encode("ascii")) <= 255
+    assert name.startswith("a" * 63 + "." + "b" * 63)

@@ -20,7 +20,7 @@ import uuid
 import warnings
 from pathlib import Path
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 REPOSITORY = "yasinmalek82/simple-cert"
 LEGACY_RELEASES = {
     "57f5f5b583dd558ac4f52d23eba9d425b03229e34f07a2227a6590c88fe504a1": "0.1.0",
@@ -148,6 +148,16 @@ def normalize_domains(values):
     if not domains:
         raise Error("At least one domain is required.")
     return sorted(domains, key=lambda name: (name.startswith("*."), name))
+
+
+CERTIFICATE_ID = r"(?:[a-z0-9][a-z0-9.-]{0,199}--)?[a-f0-9]{24}"
+
+
+def certificate_identifier(domains):
+    domains = normalize_domains(domains)
+    digest = hashlib.sha256("\n".join(domains).encode()).hexdigest()[:24]
+    label = domains[0].replace("*.", "wildcard.")[:200]
+    return f"{label}--{digest}"
 
 
 def validate_pair(folder, domains, *, check_validity=True):
@@ -345,17 +355,19 @@ class Manager:
 
     def issue(self, domains):
         domains = normalize_domains(domains)
-        identifier = hashlib.sha256("\n".join(domains).encode()).hexdigest()[:24]
+        identifier = certificate_identifier(domains)
         with locked(self.root):
             self.config()
-            folder = private_dir(self.root / "certificates" / identifier)
+            legacy = identifier.rsplit("--", 1)[1]
+            folder = self.root / "certificates" / identifier
             path = folder / "record.json"
-            if path.exists():
+            if path.exists() or (self.root / "certificates" / legacy / "record.json").exists():
                 raise Error("This domain set is already saved. Use Renew certificate (menu option 3).")
+            private_dir(folder)
             return self._obtain({"id": identifier, "domains": domains}, folder, renew=False)
 
     def renew(self, identifier):
-        if not re.fullmatch(r"[a-f0-9]{24}", identifier):
+        if not re.fullmatch(CERTIFICATE_ID, identifier):
             raise Error("Invalid certificate selection.")
         with locked(self.root):
             self.config()
@@ -689,7 +701,7 @@ def delivery_menu(manager, record, targets=None):
         if not choice.isdigit() or not 1 <= int(choice) <= len(targets):
             raise Error("Invalid panel selection.")
         target = targets[int(choice) - 1]
-    default = str(Path(target["data"]) / "certs" / "simple-cert" / record["id"])
+    default = str(Path(target["data"]) / "certs" / "simple-cert" / certificate_identifier(record["domains"]))
     print(f"Panel: {target['name']}")
     directory = input(f"Certificate directory inside the panel [{default}]: ").strip() or default
     host = panel_location(target, directory)
@@ -762,7 +774,7 @@ def clear_screen():
 
 
 def display_file(manager, record, filename):
-    if filename not in ("fullchain.pem", "key.pem") or not re.fullmatch(r"[a-f0-9]{24}", record["id"]):
+    if filename not in ("fullchain.pem", "key.pem") or not re.fullmatch(CERTIFICATE_ID, record["id"]):
         raise Error("Invalid certificate file selection.")
     if filename == "key.pem":
         if not (sys.stdin.isatty() and sys.stdout.isatty()):

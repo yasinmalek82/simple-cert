@@ -5,7 +5,7 @@ Get a Let's Encrypt certificate through Cloudflare DNS, even when your domain po
 **Quick install** — Ubuntu 22.04 or newer (including 26.04/26.10), or Debian 12/13, on the mother server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.6/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.7/install.sh | sudo bash
 ```
 
 Then open the interactive menu:
@@ -113,9 +113,17 @@ An explicit private directory can be selected with `simple-cert --state-dir /you
 Do not place it inside a repository or a public web directory.
 
 ```text
-<state>/certificates/<certificate-id>/current/fullchain.pem
-<state>/certificates/<certificate-id>/current/key.pem
+<state>/certificates/<domain>--<certificate-id>/current/fullchain.pem
+<state>/certificates/<domain>--<certificate-id>/current/key.pem
 ```
+
+New certificate folders include the first domain and a stable identifier, for example
+`cloudisnap.yasin-ai-54.ir--<identifier>`. Wildcard-only certificates use `wildcard.example.com--<identifier>`.
+The identifier distinguishes certificates with different domain sets. Domain labels longer than
+200 characters are shortened to fit filesystem limits. Existing hash-only folders and registered
+panel delivery paths remain unchanged and continue to renew. For an existing certificate, choose
+**2 → select certificate → 3** and accept the new domain-based default to publish a readable panel path;
+then update the paths in your Core manually. Earlier paths remain available and are also renewed.
 
 The current link switches both files together only after checking the key match, requested DNS names
 and validity dates with OpenSSL. Previous versions are retained. Pending issuance and publication
@@ -176,8 +184,8 @@ to publish later or choose another directory. Confirm the displayed host and pan
 by typing `yes`. The default directory inside the panel is:
 
 ```text
-/var/lib/pasarguard/certs/simple-cert/<certificate-id>/current/fullchain.pem
-/var/lib/pasarguard/certs/simple-cert/<certificate-id>/current/key.pem
+/var/lib/pasarguard/certs/simple-cert/<domain>--<certificate-id>/current/fullchain.pem
+/var/lib/pasarguard/certs/simple-cert/<domain>--<certificate-id>/current/key.pem
 ```
 
 The detected `DATA_DIR` replaces `/var/lib/pasarguard` when configured. Paste the **panel

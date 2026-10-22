@@ -134,7 +134,7 @@ def test_update_checks_release_digest_then_replaces_same_prefix(app, installed, 
     monkeypatch.setattr(app, "VERSION", "0.1.3")
     data = (ROOT / "installer.py").read_bytes()
     release = {
-        "tag_name": "v0.1.6",
+        "tag_name": "v0.1.7",
         "draft": False,
         "prerelease": False,
         "assets": [{"name": "installer.py", "digest": "sha256:" + hashlib.sha256(data).hexdigest()}],
