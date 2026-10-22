@@ -5,7 +5,7 @@ Get a Let's Encrypt certificate through Cloudflare DNS, even when your domain po
 **Quick install** — Ubuntu 22.04 or newer (including 26.04/26.10), or Debian 12/13, on the mother server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.7/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.8/install.sh | sudo bash
 ```
 
 Then open the interactive menu:
@@ -56,12 +56,13 @@ preserved. Redirected output and terminals with an unset or `dumb` TERM stay pla
 control sequences or extra Enter prompts.
 
 ```text
-1. Issue certificate
-2. List certificates and file paths
-3. Renew certificate
+1. Issue node/config certificate
+2. List node/config certificates and file paths
+3. Renew node/config certificate
 4. Cloudflare settings
 5. Update simple-cert
 6. Uninstall simple-cert
+7. Panel HTTPS certificates (separate files)
 0. Exit
 ```
 
@@ -141,7 +142,7 @@ GPL-3.0, and is not bundled in this repository. No existing acme.sh installation
 
 The output is local certificate files. Copy them securely to your destination server and configure
 your consumer there. The menu does not configure or verify a live TLS service. Keep running this tool
-on the mother server; panel/node management TLS is outside its scope.
+on the mother server; changing active panel/node management TLS is outside its scope.
 
 ## If a request fails
 
@@ -176,11 +177,11 @@ The manually dispatched `Maintenance acceptance` workflow additionally exercises
 GitHub update as root into a temporary prefix, followed by uninstall; it never changes the runner's
 system installation or uses Cloudflare credentials.
 
-## PasarGuard master-side certificate delivery
+## Node/config Core file delivery through the mother panel
 
-Run simple-cert on the **mother panel host**. After issuance, a detected local PasarGuard
-panel offers an optional delivery prompt. You can also use **2 → select certificate → 3**
-to publish later or choose another directory. Confirm the displayed host and panel paths
+Run simple-cert on the **mother panel host**. After node/config issuance, a detected local PasarGuard
+container offers an optional Core file delivery prompt. You can also use **2 → select certificate → 3**
+to publish later or choose another directory. Confirm the displayed host and container filesystem paths
 by typing `yes`. The default directory inside the panel is:
 
 ```text
@@ -188,8 +189,8 @@ by typing `yes`. The default directory inside the panel is:
 /var/lib/pasarguard/certs/simple-cert/<domain>--<certificate-id>/current/key.pem
 ```
 
-The detected `DATA_DIR` replaces `/var/lib/pasarguard` when configured. Paste the **panel
-paths** printed by the tool into the selected Core's Certificate file and Key file fields,
+The detected `DATA_DIR` replaces `/var/lib/pasarguard` when configured. Paste the **container
+filesystem paths** printed by the tool into the selected Core's Certificate file and Key file fields,
 with **Serve on node disabled**. The master reads the PEMs and supplies certificate material
 to the node; the Germany node does not need these file paths. This command only publishes
 files. It does not edit Core settings, restart services or prove live node TLS.
@@ -215,3 +216,26 @@ files. Do not delete an older path until its Core references have been updated.
 Docker acceptance uses an isolated Python fixture container with the official image-name
 pattern and generated test certificates; it verifies real mounts, non-root file access and
 renewal publication. It does not run a production PasarGuard panel or issue real certificates.
+
+## Panel HTTPS certificates: a separate section
+
+Choose **7** in the main menu for the website/dashboard certificate, separate from the
+certificates used for node/config Core TLS. This submenu supports **1: issue**, **2: list and
+view PEM files**, **3: manual renewal**, and **0: return**. Its files, ACME client state and
+certificate list are isolated under `<state>/panel-https/`. The Cloudflare account settings
+from main-menu option 4 are shared. You can use a different domain for the panel.
+
+An existing certificate configured manually in PasarGuard's `.env` is not imported or
+replaced. The tool does not edit `.env`, change SSL environment settings, adopt existing
+PEMs, attach files to the HTTPS listener, or restart/recreate any service. New panel
+certificates are separate files only; using them for the running panel requires a deliberate
+manual configuration change. Renewing them updates only the files managed in this section.
+The panel section cannot publish files through the node/config Core delivery action.
+
+**Host filesystem directory** means a directory on the mother server. **Container filesystem
+directory** means the same mounted files as seen inside the PasarGuard Docker container.
+These labels describe filesystem paths, not the panel's website URL, domain or IP. Depending
+on Docker mount mapping, the two paths may be identical or different. Use the container path
+printed by node/config delivery in the Core's Certificate file and Key file fields. This
+file-copy operation does not configure the panel website's HTTPS certificate. Cancelling
+before the `yes` confirmation publishes no certificate files to the selected destination.

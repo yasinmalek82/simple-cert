@@ -256,8 +256,9 @@ def test_expired_certificate_can_be_listed_and_selected_for_renewal(manager, mon
     assert manager.records()[0]["id"] == record["id"]
 
 
-def test_acme_export_paths_never_point_to_published_versions(app, tmp_path, monkeypatch, pair):
-    manager = app.Manager(tmp_path / "state")
+@pytest.mark.parametrize("purpose", ["core", "panel"])
+def test_acme_export_paths_never_point_to_published_versions(app, tmp_path, monkeypatch, pair, purpose):
+    manager = app.Manager(tmp_path / "state", purpose=purpose)
     manager.configure("admin@example.com", "secret-token")
     engine = manager.root / "engine"
     engine.mkdir()
@@ -280,6 +281,8 @@ def test_acme_export_paths_never_point_to_published_versions(app, tmp_path, monk
     record = manager.issue(["example.com"])
     active = manager.root / "certificates" / record["id"] / "current"
     assert all(path.parent != active.resolve() for path in destinations)
+    if purpose == "panel":
+        assert all(path.is_relative_to(tmp_path / "state/panel-https") for path in destinations)
     for path in destinations:
         path.write_text("ACME automatically updates its saved export paths on renewal")
     assert (active / "fullchain.pem").read_bytes() == (pair / "fullchain.pem").read_bytes()
@@ -333,11 +336,11 @@ def test_interactive_menu_clears_and_keeps_results_until_enter(app, tmp_path, mo
     assert "No certificates" in output
     assert "Invalid choice" in output
     assert prompts == [
-        "Choose [0-6]: ",
+        "Choose [0-7]: ",
         "Press Enter to return to the menu...",
-        "Choose [0-6]: ",
+        "Choose [0-7]: ",
         "Press Enter to return to the menu...",
-        "Choose [0-6]: ",
+        "Choose [0-7]: ",
     ]
 
 
@@ -358,7 +361,7 @@ def test_redirected_or_dumb_menu_stays_plain_and_does_not_pause(
     monkeypatch.setattr("builtins.input", answer)
     app.menu(app.Manager(tmp_path / "state"))
     assert "\033" not in capsys.readouterr().out
-    assert prompts == ["Choose [0-6]: ", "Choose [0-6]: "]
+    assert prompts == ["Choose [0-7]: ", "Choose [0-7]: "]
 
 
 def test_interactive_error_is_readable_before_redraw(app, tmp_path, monkeypatch, capsys):
@@ -678,3 +681,97 @@ def test_long_domain_folder_stays_within_filesystem_component_limit(app):
     name = app.certificate_identifier([domain])
     assert len(name.encode("ascii")) <= 255
     assert name.startswith("a" * 63 + "." + "b" * 63)
+
+
+@pytest.fixture
+def panel_https_manager(manager, app, pair, monkeypatch):
+    tool = app.Manager(manager.root, purpose="panel")
+
+    def obtain(record, destination, renew=False):
+        saved = app.load(tool.root / "certificates" / record["id"] / "record.json")
+        assert saved["purpose"] == "panel"
+        for name in ("fullchain.pem", "key.pem"):
+            shutil.copyfile(pair / name, destination / name)
+
+    monkeypatch.setattr(tool, "obtain", obtain)
+    return tool
+
+
+def test_panel_https_has_separate_storage_and_renewal(manager, panel_https_manager, app):
+    core_record = manager.issue(["example.com"])
+    core_current = manager.root / "certificates" / core_record["id"] / "current"
+    original = core_current.resolve()
+    panel_record = panel_https_manager.issue(["example.com"])
+    assert panel_https_manager.root == manager.root / "panel-https"
+    assert panel_https_manager.config() == manager.config()
+    assert panel_record["purpose"] == "panel"
+    assert manager.records()[0]["purpose"] == "core"
+    panel_https_manager.renew(panel_record["id"])
+    assert core_current.resolve() == original
+    assert len(manager.records()) == len(panel_https_manager.records()) == 1
+
+
+def test_panel_https_cannot_publish_into_core_paths(panel_https_manager, app, panel):
+    target, data = panel
+    record = panel_https_manager.issue(["example.com"])
+    with pytest.raises(app.Error, match="node/config"):
+        app.publish_delivery(panel_https_manager, record, target, "/panel-data/certs/forbidden")
+    assert not (data / "certs").exists()
+
+
+def test_panel_https_viewer_cannot_offer_core_delivery(panel_https_manager, app, monkeypatch, capsys):
+    record = panel_https_manager.issue(["example.com"])
+    values = iter(["3", "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(values))
+    app.certificate_menu(panel_https_manager, record)
+    output = capsys.readouterr().out
+    assert "Publish/change" not in output
+    assert "Invalid" in output
+
+
+def test_panel_https_menu_keeps_existing_env_and_certificates(manager, app, pair, tmp_path, monkeypatch):
+    existing = tmp_path / "existing-panel"
+    existing.mkdir()
+    (existing / ".env").write_text(
+        "UVICORN_SSL_CERTFILE=/existing/fullchain.pem\nUVICORN_SSL_KEYFILE=/existing/key.pem\n"
+    )
+    for name in ("fullchain.pem", "key.pem"):
+        shutil.copyfile(pair / name, existing / name)
+    before = {path.name: (path.read_bytes(), path.stat().st_mode) for path in existing.iterdir()}
+
+    def obtain(self, record, destination, renew=False):
+        for name in ("fullchain.pem", "key.pem"):
+            shutil.copyfile(pair / name, destination / name)
+
+    def forbidden_discovery():
+        pytest.fail("Panel HTTPS must not discover or publish Core certificates")
+
+    monkeypatch.setattr(app.Manager, "obtain", obtain)
+    monkeypatch.setattr(app, "discover_panels", forbidden_discovery)
+    monkeypatch.setattr(app, "clear_screen", lambda: False)
+    values = iter(["7", "1", "example.com", "", "y", "2", "1", "1", "0", "3", "1", "0", "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(values))
+    app.menu(manager)
+    panel_manager = app.Manager(manager.root, purpose="panel")
+    assert len(panel_manager.records()) == 1
+    assert manager.records() == []
+    assert {path.name: (path.read_bytes(), path.stat().st_mode) for path in existing.iterdir()} == before
+
+
+def test_core_delivery_refuses_existing_manual_panel_certificate_files(
+    manager, app, panel, pair, monkeypatch
+):
+    target, data = panel
+    existing = data / "certs/panel-https"
+    existing.mkdir(parents=True)
+    for name in ("fullchain.pem", "key.pem"):
+        shutil.copyfile(pair / name, existing / name)
+    (data / ".env").write_text("UVICORN_SSL_CERTFILE=/panel-data/certs/panel-https/fullchain.pem\n")
+    before = {path: (path.read_bytes(), path.stat().st_mode) for path in [data / ".env", *existing.iterdir()]}
+    record = manager.issue(["example.com"])
+    values = iter(["/panel-data/certs/panel-https", "yes"])
+    monkeypatch.setattr("builtins.input", lambda _: next(values))
+    with pytest.raises(app.Error, match="owned"):
+        app.delivery_menu(manager, record, [target])
+    assert {path: (path.read_bytes(), path.stat().st_mode) for path in before} == before
+    assert not (existing / "current").exists()

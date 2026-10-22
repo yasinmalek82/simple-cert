@@ -20,7 +20,7 @@ import uuid
 import warnings
 from pathlib import Path
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 REPOSITORY = "yasinmalek82/simple-cert"
 LEGACY_RELEASES = {
     "57f5f5b583dd558ac4f52d23eba9d425b03229e34f07a2227a6590c88fe504a1": "0.1.0",
@@ -34,14 +34,28 @@ MENU = f"""
   SIMPLE CERT v{VERSION}
   Cloudflare DNS verification | Let's Encrypt
   ------------------------------------------------
-  1. Issue certificate
-  2. List certificates and file paths
-  3. Renew certificate
+  1. Issue node/config certificate
+  2. List node/config certificates and file paths
+  3. Renew node/config certificate
   4. Cloudflare settings
   5. Update simple-cert
   6. Uninstall simple-cert
+  7. Panel HTTPS certificates (separate files)
   0. Exit
   ------------------------------------------------
+"""
+
+
+PANEL_MENU = f"""
+  SIMPLE CERT v{VERSION} | PANEL HTTPS CERTIFICATES
+  ------------------------------------------------
+  1. Issue panel HTTPS certificate
+  2. List panel HTTPS certificates and file paths
+  3. Renew panel HTTPS certificate
+  0. Back to main menu
+  ------------------------------------------------
+  Separate files only. Existing panel .env, certificates
+  and running HTTPS service are not changed or adopted.
 """
 
 
@@ -212,12 +226,16 @@ def validate_pair(folder, domains, *, check_validity=True):
 
 
 class Manager:
-    def __init__(self, root):
-        self.root = Path(root).expanduser().absolute()
+    def __init__(self, root, *, purpose="core"):
+        if purpose not in ("core", "panel"):
+            raise Error("Invalid certificate section.")
+        self.purpose = purpose
+        self.settings_root = Path(root).expanduser().absolute()
+        self.root = self.settings_root if purpose == "core" else self.settings_root / "panel-https"
         private_dir(self.root)
 
     def config(self):
-        path = self.root / "settings.json"
+        path = self.settings_root / "settings.json"
         if not path.exists():
             raise Error("Configure Cloudflare settings first (menu option 4).")
         result = load(path)
@@ -230,8 +248,8 @@ class Manager:
             raise Error("Enter a valid ACME account email address.")
         if not token or len(token) > 1024 or any(char.isspace() or ord(char) < 32 for char in token):
             raise Error("Enter a valid Cloudflare API token without spaces or newlines.")
-        with locked(self.root):
-            save(self.root / "settings.json", {"email": email, "token": token})
+        with locked(self.settings_root):
+            save(self.settings_root / "settings.json", {"email": email, "token": token})
 
     def harden(self):
         # acme.sh also saves DNS tokens in its own configuration files.
@@ -364,7 +382,9 @@ class Manager:
             if path.exists() or (self.root / "certificates" / legacy / "record.json").exists():
                 raise Error("This domain set is already saved. Use Renew certificate (menu option 3).")
             private_dir(folder)
-            return self._obtain({"id": identifier, "domains": domains}, folder, renew=False)
+            return self._obtain(
+                {"id": identifier, "domains": domains, "purpose": self.purpose}, folder, renew=False
+            )
 
     def renew(self, identifier):
         if not re.fullmatch(CERTIFICATE_ID, identifier):
@@ -376,7 +396,7 @@ class Manager:
             # A failed first issuance can be retried without pretending a certificate already exists.
             active = (folder / "current" / "fullchain.pem").is_file()
             record = self._obtain(record, folder, renew=record.get("issued", False) or active)
-        return refresh_deliveries(self, record)
+        return refresh_deliveries(self, record) if self.purpose == "core" else record
 
     def _obtain(self, record, folder, renew):
         record["operation"] = "renewing" if renew else "issuing"
@@ -567,6 +587,7 @@ def delivery_parents(path):
 
 
 def publish_delivery(manager, record, target, directory):
+    require_core_section(manager)
     fresh = next(
         (
             item
@@ -686,7 +707,13 @@ def refresh_deliveries(manager, record):
     return record
 
 
+def require_core_section(manager):
+    if manager.purpose != "core":
+        raise Error("Core path publication is available only for node/config certificates.")
+
+
 def delivery_menu(manager, record, targets=None):
+    require_core_section(manager)
     targets = discover_panels() if targets is None else targets
     if not targets:
         print("No supported local PasarGuard Docker panel found. Local certificate files are retained.")
@@ -702,10 +729,14 @@ def delivery_menu(manager, record, targets=None):
             raise Error("Invalid panel selection.")
         target = targets[int(choice) - 1]
     default = str(Path(target["data"]) / "certs" / "simple-cert" / certificate_identifier(record["domains"]))
-    print(f"Panel: {target['name']}")
-    directory = input(f"Certificate directory inside the panel [{default}]: ").strip() or default
+    print(f"PasarGuard container: {target['name']}")
+    print("Node/config Core TLS files. These are filesystem paths, not the panel URL.")
+    print("Existing panel HTTPS certificates and .env are not changed.")
+    directory = input(f"Certificate directory inside the container [{default}]: ").strip() or default
     host = panel_location(target, directory)
-    print(f"Host directory: {host}\nPanel directory: {directory}")
+    print(
+        f"Host filesystem directory (mother server): {host}\nContainer filesystem directory (for Core): {directory}"
+    )
     print("A managed copy is published. Local source and previous delivery paths are retained.")
     if input("Publish certificate and private key here? Type yes: ").strip().lower() != "yes":
         print("Panel delivery cancelled.")
@@ -718,12 +749,14 @@ def delivery_menu(manager, record, targets=None):
 
 
 def offer_panel_delivery(manager, record):
-    if not sys.stdin.isatty():
+    if manager.purpose != "core" or not sys.stdin.isatty():
         return
     targets = discover_panels()
     if (
         targets
-        and input("Local PasarGuard found. Publish a certificate copy for the panel? [y/N]: ").strip().lower()
+        and input("Local PasarGuard found. Publish node/config certificate files for Core? [y/N]: ")
+        .strip()
+        .lower()
         == "y"
     ):
         delivery_menu(manager, record, targets)
@@ -732,7 +765,7 @@ def offer_panel_delivery(manager, record):
 def settings_menu(manager):
     if not sys.stdin.isatty():
         raise Error("Settings must be entered in an interactive terminal; tokens use hidden input.")
-    previous = manager.config() if (manager.root / "settings.json").exists() else {}
+    previous = manager.config() if (manager.settings_root / "settings.json").exists() else {}
     print("\nCloudflare API token permissions: Zone > DNS > Edit and Zone > Zone > Read.")
     print("Limit the token to the DNS zone(s) you need. Never paste it into a shell command.")
     print("Your email is used for a Let's Encrypt account. Issuing accepts the CA's subscriber agreement.")
@@ -752,14 +785,16 @@ def settings_menu(manager):
 
 def show(manager, record):
     folder = manager.root / "certificates" / record["id"] / "current"
-    print("\nDomains: " + ", ".join(record["domains"]))
+    purpose = "Panel HTTPS" if manager.purpose == "panel" else "Node/config Core TLS"
+    print("\nCertificate section: " + purpose)
+    print("Domains: " + ", ".join(record["domains"]))
     print("Expires (UTC): " + record.get("expires_at", "not issued"))
     print("Last operation: " + record["operation"])
     if (folder / "fullchain.pem").is_file():
         print(f"Full chain: {folder / 'fullchain.pem'}\nPrivate key: {folder / 'key.pem'}")
-        print("Local files only. Copy them to the destination service when needed.")
+        print("Separate certificate files only. Existing panel HTTPS and .env are unchanged.")
     for delivery in record.get("deliveries", []):
-        print(f"Panel {delivery['name']}: {delivery['status']}")
+        print(f"Core file delivery via container {delivery['name']}: {delivery['status']}")
         print(f"Certificate file: {delivery['directory']}/current/fullchain.pem")
         print(f"Key file: {delivery['directory']}/current/key.pem")
 
@@ -802,14 +837,17 @@ def certificate_menu(manager, record):
     while True:
         interactive = clear_screen()
         show(manager, record)
-        print(
-            "\n1. View fullchain.pem\n2. View key.pem (private)\n3. Publish/change PasarGuard certificate path\n0. Back to main menu"
-        )
-        choice = input("Choose action [0-3]: ").strip()
+        print("\n1. View fullchain.pem\n2. View key.pem (private)")
+        if manager.purpose == "core":
+            print("3. Publish/change node/config Core paths")
+        print("0. Back to panel HTTPS menu" if manager.purpose == "panel" else "0. Back to main menu")
+        choice = input(
+            "Choose action [0-2]: " if manager.purpose == "panel" else "Choose action [0-3]: "
+        ).strip()
         if choice == "0":
             return
         try:
-            if choice == "3":
+            if choice == "3" and manager.purpose == "core":
                 record = delivery_menu(manager, record)
             elif choice not in ("1", "2"):
                 raise Error("Invalid file selection.")
@@ -1016,9 +1054,12 @@ def update_menu(manager):
 def menu(manager):
     while True:
         interactive = clear_screen()
-        print(MENU)
+        panel_section = manager.purpose == "panel"
+        print(PANEL_MENU if panel_section else MENU)
         try:
-            choice = input("Choose [0-6]: ").strip()
+            choice = input("Choose [0-3]: " if panel_section else "Choose [0-7]: ").strip()
+            if panel_section and choice not in ("0", "1", "2", "3"):
+                raise Error("Invalid choice. Choose a number from 0 to 3.")
             if choice == "0":
                 return
             if choice == "4":
@@ -1029,10 +1070,18 @@ def menu(manager):
             elif choice == "6":
                 if uninstall_menu(manager):
                     return
+            elif choice == "7":
+                menu(Manager(manager.settings_root, purpose="panel"))
+                continue
             elif choice == "1":
-                if not (manager.root / "settings.json").exists():
+                if not (manager.settings_root / "settings.json").exists():
                     settings_menu(manager)
-                domains = normalize_domains([input("Domain (example.com or *.example.com): ")])
+                domain_prompt = (
+                    "Panel HTTPS domain (example.com or *.example.com): "
+                    if panel_section
+                    else "Node/config domain (example.com or *.example.com): "
+                )
+                domains = normalize_domains([input(domain_prompt)])
                 if (
                     not domains[0].startswith("*.")
                     and input("Include *." + domains[0] + " as well? [y/N]: ").strip().lower() == "y"
@@ -1068,7 +1117,7 @@ def menu(manager):
                         print("The ACME client renews only when due; no forced renewal is performed.")
                         show(manager, manager.renew(selected["id"]))
             else:
-                print("Invalid choice. Choose a number from 0 to 6.")
+                print("Invalid choice. Choose a number from 0 to 7.")
         except Error as error:
             print(f"\nError: {error}")
         except KeyboardInterrupt:

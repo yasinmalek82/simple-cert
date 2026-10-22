@@ -52,7 +52,7 @@ def terminal_uninstall(script, other, state, remove_others):
             output += os.read(master, 65536)
 
     try:
-        until(b"Choose [0-6]:")
+        until(b"Choose [0-7]:")
         os.write(master, b"6\n")
         until(b"Type uninstall:")
         os.write(master, b"uninstall\n")
