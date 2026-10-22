@@ -18,7 +18,7 @@ import uuid
 import warnings
 from pathlib import Path
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 ACME_COMMIT = "3688b094adffc1a52d3b994c586cd97caa2f0b85"
 CA = "https://acme-v02.api.letsencrypt.org/directory"
 MENU = """
@@ -426,6 +426,11 @@ def show(manager, record):
 
 def menu(manager):
     while True:
+        interactive = (
+            sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM", "") not in ("", "dumb")
+        )
+        if interactive:
+            print("\033[2J\033[H", end="", flush=True)
         print(MENU)
         try:
             choice = input("Choose [0-4]: ").strip()
@@ -452,21 +457,21 @@ def menu(manager):
                 records = manager.records()
                 if not records:
                     print("No certificates saved yet.")
-                    continue
-                for index, record in enumerate(records, 1):
-                    print(
-                        f"{index}. {', '.join(record['domains'])} | {record.get('expires_at', 'not issued')} | {record['operation']}"
-                    )
-                    if choice == "2":
-                        show(manager, record)
-                if choice == "3":
-                    selection = input("Certificate number (0 to cancel): ").strip()
-                    if selection == "0":
-                        continue
-                    if not selection.isdigit() or not 1 <= int(selection) <= len(records):
-                        raise Error("Invalid certificate number.")
-                    print("The ACME client renews only when due; no forced renewal is performed.")
-                    show(manager, manager.renew(records[int(selection) - 1]["id"]))
+                else:
+                    for index, record in enumerate(records, 1):
+                        print(
+                            f"{index}. {', '.join(record['domains'])} | {record.get('expires_at', 'not issued')} | {record['operation']}"
+                        )
+                        if choice == "2":
+                            show(manager, record)
+                    if choice == "3":
+                        selection = input("Certificate number (0 to cancel): ").strip()
+                        if selection == "0":
+                            continue
+                        if not selection.isdigit() or not 1 <= int(selection) <= len(records):
+                            raise Error("Invalid certificate number.")
+                        print("The ACME client renews only when due; no forced renewal is performed.")
+                        show(manager, manager.renew(records[int(selection) - 1]["id"]))
             else:
                 print("Invalid choice. Choose a number from 0 to 4.")
         except Error as error:
@@ -476,6 +481,14 @@ def menu(manager):
         except EOFError:
             print("\nGoodbye.")
             return
+        if interactive:
+            try:
+                input("Press Enter to return to the menu...")
+            except EOFError:
+                print("\nGoodbye.")
+                return
+            except KeyboardInterrupt:
+                print()
 
 
 def main():

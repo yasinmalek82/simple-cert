@@ -5,7 +5,7 @@ Get a Let's Encrypt certificate through Cloudflare DNS, even when your domain po
 **Quick install** — Ubuntu 22.04 or newer (including 26.04/26.10), or Debian 12/13, on the mother server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.1/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.2/install.sh | sudo bash
 ```
 
 Then open the interactive menu:
@@ -47,6 +47,11 @@ Issuance uses the public Let's Encrypt service and accepts its
 Certificate Transparency logs. The first use downloads the official ACME client from GitHub.
 
 ## Menu
+
+In an interactive SSH terminal, each menu opens at the top of a cleared screen. Operation results
+and errors remain visible until you press Enter; then the menu is redrawn. Terminal scrollback is
+preserved. Redirected output and terminals with an unset or `dumb` TERM stay plain, without screen
+control sequences or extra Enter prompts.
 
 ```text
 1. Issue certificate

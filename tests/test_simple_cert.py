@@ -311,3 +311,68 @@ def test_hidden_input_never_falls_back_to_echo(app, tmp_path, monkeypatch):
     monkeypatch.setattr(app.getpass, "getpass", unavailable)
     with pytest.raises(app.Error, match="hidden"):
         app.settings_menu(app.Manager(tmp_path / "state"))
+
+
+def test_interactive_menu_clears_and_keeps_results_until_enter(app, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    values = iter(["2", "", "invalid", "", "0"])
+    prompts = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        return next(values)
+
+    monkeypatch.setattr("builtins.input", answer)
+    app.menu(app.Manager(tmp_path / "state"))
+    output = capsys.readouterr().out
+    assert output.startswith("\033[2J\033[H")
+    assert output.count("\033[2J\033[H") == 3
+    assert "No certificates" in output
+    assert "Invalid choice" in output
+    assert prompts == [
+        "Choose [0-4]: ",
+        "Press Enter to return to the menu...",
+        "Choose [0-4]: ",
+        "Press Enter to return to the menu...",
+        "Choose [0-4]: ",
+    ]
+
+
+@pytest.mark.parametrize("tty, term", [(False, "xterm"), (True, "dumb"), (True, "")])
+def test_redirected_or_dumb_menu_stays_plain_and_does_not_pause(
+    app, tmp_path, monkeypatch, capsys, tty, term
+):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: tty)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+    monkeypatch.setenv("TERM", term)
+    values = iter(["2", "0"])
+    prompts = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        return next(values)
+
+    monkeypatch.setattr("builtins.input", answer)
+    app.menu(app.Manager(tmp_path / "state"))
+    assert "\033" not in capsys.readouterr().out
+    assert prompts == ["Choose [0-4]: ", "Choose [0-4]: "]
+
+
+def test_interactive_error_is_readable_before_redraw(app, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setenv("TERM", "xterm")
+    manager = app.Manager(tmp_path / "state")
+
+    def fail():
+        raise app.Error("Example safe failure")
+
+    monkeypatch.setattr(manager, "records", fail)
+    values = iter(["2", "", "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(values))
+    app.menu(manager)
+    output = capsys.readouterr().out
+    assert "Error: Example safe failure" in output
+    assert output.count("\033[2J\033[H") == 2
