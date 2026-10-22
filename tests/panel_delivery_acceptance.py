@@ -49,6 +49,14 @@ def main():
             "-out",
             str(pair / "fullchain.pem"),
         )
+        initial = data / "initial-panel-cert"
+        initial.mkdir(mode=0o755)
+        for filename in ("fullchain.pem", "key.pem"):
+            destination = initial / filename
+            shutil.copyfile(pair / filename, destination)
+            destination.chmod(0o600)
+            os.chown(destination, 1000, 1000)
+        original = {path.name: (path.read_bytes(), path.stat().st_mode) for path in initial.iterdir()}
         command(
             "docker",
             "run",
@@ -57,6 +65,10 @@ def main():
             name,
             "--user",
             "1000:1000",
+            "--env",
+            "UVICORN_SSL_CERTFILE=/var/lib/pasarguard/initial-panel-cert/fullchain.pem",
+            "--env",
+            "UVICORN_SSL_KEYFILE=/var/lib/pasarguard/initial-panel-cert/key.pem",
             "--volume",
             f"{data}:/var/lib/pasarguard",
             image,
@@ -66,6 +78,10 @@ def main():
         )
         try:
             target = next(item for item in app.discover_panels() if item["name"] == name)
+            status = app.inspect_panel_https(target)
+            assert status["state"] == "valid configured PEM"
+            assert status["domains"] == ["example.com"]
+            assert status["host_certfile"] == str(initial / "fullchain.pem")
             manager = app.Manager(root / "state")
             manager.configure("fixture@example.com", "fixture-token")
 
@@ -88,7 +104,12 @@ def main():
             assert len(record["deliveries"]) == 2
             assert current.is_dir()
             assert (manager.root / "certificates" / record["id"] / "current/key.pem").is_file()
-            print("PASS: actual Docker mount, non-root reader, private PEMs, renewal and second delivery")
+            assert {
+                path.name: (path.read_bytes(), path.stat().st_mode) for path in initial.iterdir()
+            } == original
+            print(
+                "PASS: read-only configured panel status, unchanged existing PEMs, Docker mounts, private reader and renewal"
+            )
         finally:
             command("docker", "rm", "-f", name)
 

@@ -10,17 +10,19 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import uuid
 import warnings
 from pathlib import Path
 
-VERSION = "0.1.8"
+VERSION = "0.1.9"
 REPOSITORY = "yasinmalek82/simple-cert"
 LEGACY_RELEASES = {
     "57f5f5b583dd558ac4f52d23eba9d425b03229e34f07a2227a6590c88fe504a1": "0.1.0",
@@ -52,6 +54,7 @@ PANEL_MENU = f"""
   1. Issue panel HTTPS certificate
   2. List panel HTTPS certificates and file paths
   3. Renew panel HTTPS certificate
+  4. Refresh current panel HTTPS status
   0. Back to main menu
   ------------------------------------------------
   Separate files only. Existing panel .env, certificates
@@ -450,6 +453,7 @@ def docker_panels(containers):
             (value[9:] for value in config.get("Env", []) if value.startswith("DATA_DIR=")),
             "/var/lib/pasarguard",
         )
+        compose_dir = (config.get("Labels") or {}).get("com.docker.compose.project.working_dir")
         result.append(
             {
                 "kind": "docker",
@@ -457,6 +461,16 @@ def docker_panels(containers):
                 "name": item["Name"].lstrip("/"),
                 "data": data,
                 "userns": item.get("HostConfig", {}).get("UsernsMode", ""),
+                "https": {
+                    name: value
+                    for entry in config.get("Env", [])
+                    if "=" in entry
+                    for name, value in [entry.split("=", 1)]
+                    if name in HTTPS_KEYS
+                },
+                "env_file": str(Path(compose_dir) / ".env")
+                if compose_dir and Path(compose_dir).is_absolute()
+                else None,
                 "mounts": [
                     {key: mount.get(key) for key in ("Source", "Destination", "Type", "RW")}
                     for mount in item.get("Mounts", [])
@@ -481,6 +495,462 @@ def discover_panels():
         return docker_panels(json.loads(run(["docker", "inspect", *ids], timeout=15).stdout))
     except (Error, ValueError, KeyError, IndexError, TypeError):
         return []
+
+
+HTTPS_KEYS = {"UVICORN_SSL_CERTFILE", "UVICORN_SSL_KEYFILE", "UVICORN_HOST", "UVICORN_PORT"}
+
+
+def read_settings_values(path, keys):
+    """Read selected assignments without sourcing shell or dotenv code."""
+    result = {}
+    try:
+        if not path.is_file() or path.stat().st_size > 1024 * 1024:
+            return result
+        for line in path.read_text(errors="replace").splitlines():
+            name, separator, value = line.strip().removeprefix("export ").partition("=")
+            if not separator or name.strip() not in keys:
+                continue
+            try:
+                values = shlex.split(value, comments=True)
+            except ValueError:
+                continue
+            if len(values) == 1:
+                result[name.strip()] = values[0]
+    except OSError:
+        pass
+    return result
+
+
+def panel_certificate_host_path(target, path):
+    """Read mapping permits read-only mounts and normal live/archive symlinks."""
+    path = checked_path(path)
+    if target["kind"] == "native":
+        return path
+    mounts = [
+        item
+        for item in target["mounts"]
+        if item.get("Destination") and path.is_relative_to(Path(item["Destination"]))
+    ]
+    if not mounts:
+        raise Error("Configured certificate has no local host mount mapping.")
+    mount = max(mounts, key=lambda item: len(Path(item["Destination"]).parts))
+    source = checked_path(mount["Source"])
+    host = source / path.relative_to(mount["Destination"])
+    if not host.resolve().is_relative_to(source.resolve()):
+        raise Error("Certificate symlink leaves its mapped mount; runtime path is unverified.")
+    return host
+
+
+def inspect_panel_https(target):
+    values = dict(target.get("https", {}))
+    source = "running container environment"
+    if "UVICORN_SSL_CERTFILE" not in values and target.get("env_file"):
+        values = {**read_settings_values(Path(target["env_file"]), HTTPS_KEYS), **values}
+        source = "env file (runtime configuration not verified)"
+    status = {
+        "name": target["name"],
+        "source": source,
+        "public_url": "not confirmed",
+        "state": "certificate unavailable",
+        "certfile": values.get("UVICORN_SSL_CERTFILE", "not configured"),
+        "keyfile": values.get("UVICORN_SSL_KEYFILE", "not configured"),
+        "listener": values.get("UVICORN_HOST", "0.0.0.0") + ":" + values.get("UVICORN_PORT", "8000"),
+    }
+    try:
+        host = panel_certificate_host_path(target, status["certfile"])
+        status["host_certfile"] = str(host)
+        if values.get("UVICORN_SSL_KEYFILE"):
+            try:
+                status["host_keyfile"] = str(
+                    panel_certificate_host_path(target, values["UVICORN_SSL_KEYFILE"])
+                )
+            except Error:
+                pass
+        if not host.is_file() or host.stat().st_size > 1024 * 1024:
+            return status
+        details = run(
+            [
+                "openssl",
+                "x509",
+                "-in",
+                str(host),
+                "-noout",
+                "-dates",
+                "-ext",
+                "subjectAltName",
+                "-subject",
+                "-sha256",
+                "-fingerprint",
+            ],
+            timeout=15,
+            message="Configured panel certificate cannot be decoded; private output suppressed.",
+        ).stdout.decode("ascii", errors="replace")
+        dates = dict(
+            line.split("=", 1)
+            for line in details.splitlines()
+            if line.startswith(("notBefore=", "notAfter="))
+        )
+        start = dt.datetime.strptime(dates["notBefore"], "%b %d %H:%M:%S %Y %Z").replace(
+            tzinfo=dt.timezone.utc
+        )
+        end = dt.datetime.strptime(dates["notAfter"], "%b %d %H:%M:%S %Y %Z").replace(tzinfo=dt.timezone.utc)
+        domains = sorted(set(re.findall(r"DNS:([a-zA-Z0-9.*-]+)", details)))
+        now = dt.datetime.now(dt.timezone.utc)
+        status.update(
+            {
+                "domains": domains,
+                "expires_at": end.isoformat(),
+                "days_remaining": (end - now).days,
+                "state": "expired"
+                if end <= now
+                else "not yet valid"
+                if now < start
+                else "valid configured PEM",
+            }
+        )
+    except (Error, OSError, KeyError, ValueError):
+        pass
+    return status
+
+
+def renewal_command(command):
+    """Recognize direct clients and simple env/shell wrappers, without execution."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    for index, token in enumerate(tokens):
+        if token in (";", "&&", "||", "|", ">", ">>", "<", "&"):
+            tokens = tokens[:index]
+            break
+    if tokens and Path(tokens[0]).name == "env":
+        tokens.pop(0)
+    while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+        tokens.pop(0)
+    if (
+        tokens
+        and Path(tokens[0]).name in ("sh", "bash")
+        and len(tokens) > 1
+        and not tokens[1].startswith("-")
+    ):
+        tokens.pop(0)
+    if not tokens:
+        return None
+    client, args = Path(tokens[0]).name, tokens[1:]
+
+    def option(flag, default=None):
+        for index, value in enumerate(args):
+            if value.startswith(flag + "="):
+                return value.split("=", 1)[1]
+            if value == flag:
+                return args[index + 1] if index + 1 < len(args) else ""
+        return default
+
+    if client == "acme.sh" and ("--cron" in args or "--renew" in args):
+        domain = option("-d") or option("--domain")
+        if "--cron" not in args and not domain:
+            return None
+        home = str(Path(tokens[0]).parent) if Path(tokens[0]).is_absolute() else "/root/.acme.sh"
+        result = {"client": client, "home": option("--home", home)}
+        if domain:
+            result["domain"] = domain
+        return result
+    if client == "certbot" and "renew" in args:
+        result = {"client": client, "home": option("--config-dir", "/etc/letsencrypt")}
+        name = option("--cert-name")
+        if name:
+            result["cert_name"] = name
+        return result
+    return None
+
+
+def parse_renewal_cron(text, *, source, active, system=False):
+    jobs = []
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if not parts or parts[0].startswith("#"):
+            continue
+        if parts[0].startswith("@"):
+            if parts[0] not in (
+                "@hourly",
+                "@daily",
+                "@midnight",
+                "@weekly",
+                "@monthly",
+                "@yearly",
+                "@annually",
+            ):
+                continue
+            skip = 1
+        else:
+            if len(parts) < 6 or not all(re.fullmatch(r"[0-9*/,-]+", field) for field in parts[:5]):
+                continue
+            skip = 5
+        command = " ".join(parts[skip + int(system) :])
+        job = renewal_command(command)
+        if job:
+            jobs.append({**job, "source": source, "active": active})
+    return jobs
+
+
+def renewal_jobs(*, system_root=Path("/")):
+    jobs = []
+    deadline = time.monotonic() + 15
+    cron_active = None
+    for unit in ("cron.service", "crond.service"):
+        try:
+            result = run(["systemctl", "is-active", unit], allowed=(0, 3, 4), timeout=3)
+            if result.stdout.strip() == b"active":
+                cron_active = True
+                break
+            if result.stdout.strip() == b"inactive":
+                cron_active = False
+        except Error:
+            pass
+    candidates = [(system_root / "etc/crontab", True)]
+    candidates += [(path, True) for path in (system_root / "etc/cron.d").glob("*")]
+    candidates += [
+        (path, False)
+        for base in ("var/spool/cron/crontabs", "var/spool/cron")
+        for path in (system_root / base).glob("*")
+    ]
+    for path, system in candidates:
+        try:
+            if path.is_file() and path.stat().st_size <= 1024 * 1024:
+                jobs.extend(
+                    parse_renewal_cron(
+                        path.read_text(errors="replace"), source=str(path), active=cron_active, system=system
+                    )
+                )
+        except OSError:
+            pass
+    try:
+        jobs.extend(
+            parse_renewal_cron(
+                run(["crontab", "-l"], allowed=(0, 1), timeout=3).stdout.decode(errors="replace"),
+                source="current-user crontab",
+                active=cron_active,
+            )
+        )
+    except Error:
+        pass
+    try:
+        listed = run(
+            ["systemctl", "list-timers", "--all", "--no-legend", "--no-pager"], timeout=3
+        ).stdout.decode(errors="replace")
+        timers = sorted(set(re.findall(r"[A-Za-z0-9_.@:-]+\.timer\b", listed)))
+        if len(timers) > 128:
+            jobs.append(
+                {
+                    "client": "unknown",
+                    "source": "timer inventory limit reached; coverage is partial",
+                    "active": None,
+                }
+            )
+        for timer in timers[:128]:
+            if time.monotonic() >= deadline:
+                jobs.append(
+                    {
+                        "client": "unknown",
+                        "source": "systemd scan budget reached; coverage is partial",
+                        "active": None,
+                    }
+                )
+                break
+            props = run(
+                [
+                    "systemctl",
+                    "show",
+                    timer,
+                    "--property=ActiveState,Unit,NextElapseUSecRealtime",
+                    "--no-pager",
+                ],
+                timeout=3,
+            ).stdout.decode(errors="replace")
+            values = dict(line.split("=", 1) for line in props.splitlines() if "=" in line)
+            service = values.get("Unit", timer.removesuffix(".timer") + ".service")
+            if not re.fullmatch(r"[A-Za-z0-9_.@:-]+\.service", service):
+                continue
+            props = run(
+                [
+                    "systemctl",
+                    "show",
+                    service,
+                    "--property=ExecStart,Result,ExecMainExitTimestamp",
+                    "--no-pager",
+                ],
+                timeout=3,
+            ).stdout.decode(errors="replace")
+            command = re.search(r"argv\[\]=(.*?)\s+;", props)
+            job = renewal_command(command.group(1)) if command else None
+            if job:
+                result = re.search(r"^Result=(.*)$", props, re.MULTILINE)
+                finished = re.search(r"^ExecMainExitTimestamp=(.+)$", props, re.MULTILINE)
+                jobs.append(
+                    {
+                        **job,
+                        "source": timer,
+                        "active": values.get("ActiveState") == "active",
+                        "next_run": values.get("NextElapseUSecRealtime", "unknown"),
+                        "last_result": result.group(1) if result and finished else "not recorded",
+                        "last_run": finished.group(1) if finished else "not recorded",
+                    }
+                )
+    except Error:
+        jobs.append({"client": "unknown", "source": "systemd timer inspection unavailable", "active": None})
+    return jobs
+
+
+def inspect_renewal(status, jobs, *, system_root=Path("/")):
+    host = status.get("host_certfile")
+    if not host:
+        return []
+    expected = Path(host).resolve()
+    matches = []
+    homes = {"/root/.acme.sh", str(Path.home() / ".acme.sh")}
+    homes.update(job["home"] for job in jobs if job.get("client") == "acme.sh")
+    records = []
+    for home in homes:
+        if not Path(home).is_absolute() or ".." in Path(home).parts:
+            continue
+        directory = system_root / home.lstrip("/")
+        for config in list(directory.glob("*/*.conf"))[:512]:
+            values = read_settings_values(
+                config, {"Le_RealFullChainPath", "Le_ReloadCmd", "Le_Domain", "Le_Alt"}
+            )
+            path = values.get("Le_RealFullChainPath")
+            if path and Path(path).is_absolute() and Path(path).resolve() == expected:
+                records.append(
+                    {
+                        "client": "acme.sh",
+                        "home": home,
+                        "record": str(config),
+                        "domain": values.get("Le_Domain", config.stem),
+                        "reload_hook": "configured (not executed)"
+                        if values.get("Le_ReloadCmd")
+                        else "not found",
+                    }
+                )
+    certbot_homes = {"/etc/letsencrypt"}
+    certbot_homes.update(job["home"] for job in jobs if job.get("client") == "certbot")
+    for home in certbot_homes:
+        if not Path(home).is_absolute() or ".." in Path(home).parts:
+            continue
+        for config in list((system_root / home.lstrip("/") / "renewal").glob("*.conf"))[:512]:
+            values = read_settings_values(config, {"fullchain", "renew_hook", "deploy_hook"})
+            path = values.get("fullchain")
+            if path and Path(path).is_absolute() and Path(path).resolve() == expected:
+                records.append(
+                    {
+                        "client": "certbot",
+                        "home": home,
+                        "record": str(config),
+                        "cert_name": config.stem,
+                        "reload_hook": "configured (not executed)"
+                        if values.get("renew_hook") or values.get("deploy_hook")
+                        else "not found",
+                    }
+                )
+    for record in records:
+        related = [
+            job
+            for job in jobs
+            if job.get("client") == record["client"]
+            and job.get("home") == record["home"]
+            and (not job.get("domain") or job["domain"] == record.get("domain"))
+            and (not job.get("cert_name") or job["cert_name"] == record.get("cert_name"))
+        ]
+        if not related:
+            matches.append(
+                {**record, "source": "no matching schedule found", "state": "tracking record only"}
+            )
+        for job in related:
+            state = (
+                "scheduled"
+                if job["active"] is True
+                else "scheduler inactive"
+                if job["active"] is False
+                else "scheduler state unknown"
+            )
+            matches.append({**record, **job, "state": state})
+    return matches
+
+
+def show_panel_https_status():
+    """Only read config, certificate metadata and schedules. Do not invoke clients."""
+    print("Inspecting panel certificate and renewal schedules (read-only)...", flush=True)
+    lines = [
+        "\nCURRENT PANEL HTTPS STATUS (read-only)",
+        "Configured files only; public URL and live served TLS are not verified.",
+    ]
+    targets = discover_panels()
+    if not targets:
+        env_file = Path("/opt/pasarguard/.env")
+        if env_file.is_file():
+            targets = [
+                {
+                    "kind": "native",
+                    "name": "standard .env configuration",
+                    "https": {},
+                    "env_file": str(env_file),
+                }
+            ]
+    if not targets:
+        lines.append("No supported current panel configuration found; HTTPS status is unknown.")
+    try:
+        jobs = renewal_jobs() if targets else []
+    except (Error, OSError, ValueError):
+        jobs = [{"client": "unknown", "source": "renewal schedule inspection unavailable", "active": None}]
+    for target in targets:
+        status = inspect_panel_https(target)
+        lines += [
+            f"Panel/container: {status['name']}",
+            f"Configuration source: {status['source']}",
+            f"Public panel URL: {status['public_url']} (certificate names are not a verified URL)",
+            f"Configured listener: {status['listener']}",
+            f"Configured certificate: {status['certfile']}",
+            f"Configured private key path: {status['keyfile']}",
+            f"Host certificate path: {status.get('host_certfile', 'unmapped')}",
+            f"Host private key path: {status.get('host_keyfile', 'unmapped')}",
+            f"Certificate state: {status['state']}",
+        ]
+        if status.get("expires_at"):
+            lines += [
+                "Certificate domain(s): " + ", ".join(status["domains"]),
+                f"Expires (UTC): {status['expires_at']} | Days remaining: {status['days_remaining']}",
+            ]
+        try:
+            matches = inspect_renewal(status, jobs)
+        except (Error, OSError, ValueError):
+            matches = []
+            lines.append("Renewal tracking records could not be inspected completely.")
+        for match in matches:
+            lines += [
+                f"Renewal evidence: {match['client']} via {match['source']} | {match['state']}",
+                f"Associated export record: {match['record']} | Reload hook: {match['reload_hook']}",
+            ]
+            if match.get("next_run"):
+                lines.append(
+                    f"Next timer run: {match['next_run']} | Last service result: {match.get('last_result', 'unknown')} | Last exit: {match.get('last_run', 'not recorded')}"
+                )
+        if not matches:
+            lines.append(
+                "Renewal owner: unknown; no matching export record/schedule found in inspected locations."
+            )
+    for job in jobs:
+        if job.get("client") == "unknown":
+            lines.append("Scan coverage: " + job["source"])
+    lines += [
+        "A configured schedule is not proof of successful renewal or TLS reload.",
+        "Custom jobs, reverse proxies, other containers and nonstandard env paths may require manual inspection.",
+    ]
+    report = "\n".join(lines)
+    # Escape terminal control sequences from local paths/configuration metadata.
+    report = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "?", report)
+    print(report)
+    return report
 
 
 def checked_path(value):
@@ -1052,14 +1522,23 @@ def update_menu(manager):
 
 
 def menu(manager):
+    status_report = None
     while True:
         interactive = clear_screen()
         panel_section = manager.purpose == "panel"
+        if panel_section:
+            if status_report is None:
+                status_report = show_panel_https_status()
+            else:
+                print(status_report)
         print(PANEL_MENU if panel_section else MENU)
         try:
-            choice = input("Choose [0-3]: " if panel_section else "Choose [0-7]: ").strip()
+            choice = input("Choose [0-4]: " if panel_section else "Choose [0-7]: ").strip()
+            if panel_section and choice == "4":
+                status_report = None
+                continue
             if panel_section and choice not in ("0", "1", "2", "3"):
-                raise Error("Invalid choice. Choose a number from 0 to 3.")
+                raise Error("Invalid choice. Choose a number from 0 to 4.")
             if choice == "0":
                 return
             if choice == "4":

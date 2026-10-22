@@ -743,11 +743,8 @@ def test_panel_https_menu_keeps_existing_env_and_certificates(manager, app, pair
         for name in ("fullchain.pem", "key.pem"):
             shutil.copyfile(pair / name, destination / name)
 
-    def forbidden_discovery():
-        pytest.fail("Panel HTTPS must not discover or publish Core certificates")
-
     monkeypatch.setattr(app.Manager, "obtain", obtain)
-    monkeypatch.setattr(app, "discover_panels", forbidden_discovery)
+    monkeypatch.setattr(app, "show_panel_https_status", lambda: None)
     monkeypatch.setattr(app, "clear_screen", lambda: False)
     values = iter(["7", "1", "example.com", "", "y", "2", "1", "1", "0", "3", "1", "0", "0"])
     monkeypatch.setattr("builtins.input", lambda _: next(values))

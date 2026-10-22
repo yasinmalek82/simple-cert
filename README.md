@@ -5,7 +5,7 @@ Get a Let's Encrypt certificate through Cloudflare DNS, even when your domain po
 **Quick install** — Ubuntu 22.04 or newer (including 26.04/26.10), or Debian 12/13, on the mother server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.8/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.9/install.sh | sudo bash
 ```
 
 Then open the interactive menu:
@@ -221,8 +221,8 @@ renewal publication. It does not run a production PasarGuard panel or issue real
 
 Choose **7** in the main menu for the website/dashboard certificate, separate from the
 certificates used for node/config Core TLS. This submenu supports **1: issue**, **2: list and
-view PEM files**, **3: manual renewal**, and **0: return**. Its files, ACME client state and
-certificate list are isolated under `<state>/panel-https/`. The Cloudflare account settings
+view PEM files**, **3: manual renewal**, **4: refresh current HTTPS status**, and **0: return**.
+Its files, ACME client state and certificate list are isolated under `<state>/panel-https/`. The Cloudflare account settings
 from main-menu option 4 are shared. You can use a different domain for the panel.
 
 An existing certificate configured manually in PasarGuard's `.env` is not imported or
@@ -239,3 +239,49 @@ on Docker mount mapping, the two paths may be identical or different. Use the co
 printed by node/config delivery in the Core's Certificate file and Key file fields. This
 file-copy operation does not configure the panel website's HTTPS certificate. Cancelling
 before the `yes` confirmation publishes no certificate files to the selected destination.
+
+## Inspecting the existing panel HTTPS certificate
+
+Opening **7** first shows a read-only report for the existing panel configuration, including
+certificate DNS names, expiry in UTC, days remaining, the configured certificate/key paths,
+and host mount mappings. Read-only mounts and normal certificate live/archive symlinks are
+supported. Certificate metadata is decoded with OpenSSL; the status inspector does not read
+private key contents or import existing files into its certificate list.
+
+The running official Docker container's `UVICORN_SSL_*` environment is preferred. If absent,
+a Compose-labelled working directory's `.env` is a **configuration candidate**, explicitly
+marked as not runtime-verified. With no detected container, `/opt/pasarguard/.env` is inspected
+as the standard candidate. Env files are parsed for an allowlist of TLS/listener fields, never
+sourced as shell code. Tokens, passwords, raw crontab lines and service commands are not printed.
+
+**Renewal evidence** is associated with the configured host certificate path, not merely
+with an installed program or a timer name:
+
+- acme.sh: a matching `Le_RealFullChainPath` export record and a recognized cron/systemd job.
+- Certbot: a matching renewal configuration's `fullchain` path and a recognized renewal job.
+- The report distinguishes a schedule with an active scheduler, an inactive scheduler, unknown
+  scheduler state, and a tracking record without a matching schedule. A missing match is reported
+  as **unknown**, not as proof that no automation exists.
+- Timer next-run time and last service result are shown when available. A default service result
+  without a recorded exit timestamp is not presented as a completed renewal. Per-record reload
+  hooks are reported as configured/not found; their commands are never executed.
+
+The inspector reads current-user/system cron files and accessible cron spools, queries systemd
+timer/service metadata, and checks standard acme.sh and Certbot records plus homes explicitly
+referenced by recognized jobs. Only direct clients and simple env/shell wrappers are recognized.
+Custom scripts, unusual homes, other containers/users, global deploy hooks and incomplete access
+can prevent attribution. It does not execute renewal clients, hooks, inspected commands or services.
+The systemd scan is bounded and unavailable/partial inspection is indicated. Reports are cached
+while the submenu is open; choose **4** to refresh. Root is recommended for complete read access.
+
+The current [official PasarGuard installer](https://github.com/PasarGuard/scripts/blob/main/pasarguard.sh)
+uses acme.sh for its Let's Encrypt setup, installs a cron renewal job and registers a reload hook.
+Pointing `UVICORN_SSL_CERTFILE`/`UVICORN_SSL_KEYFILE` at a manually obtained certificate does not
+by itself establish an automatic renewal schedule. This report checks local evidence independently
+of the installer defaults.
+
+This is the certificate **configured on disk**. It does not prove that a running HTTPS process has
+reloaded that file. Public URLs cannot be safely inferred from a wildcard/multi-domain certificate,
+a bind address or a proxy/CDN configuration, so the public URL remains **not confirmed**. DNS names
+in the certificate are displayed separately. External/live TLS and reverse-proxy certificates are
+not probed. No existing certificate, `.env`, cron job, service or timer is changed.
