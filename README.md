@@ -2,10 +2,10 @@
 
 Get a Let's Encrypt certificate through Cloudflare DNS, even when your domain points to a different server.
 
-**Quick install** — Ubuntu 22.04/24.04 or Debian 12/13, on the mother server:
+**Quick install** — Ubuntu 22.04 or newer (including 26.04/26.10), or Debian 12/13, on the mother server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.0/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.1/install.sh | sudo bash
 ```
 
 Then open the interactive menu:
@@ -20,6 +20,15 @@ If you are already root, omit `sudo`. The install command requires `curl`; on a 
 The installer installs Python 3, Git, OpenSSL, curl and CA certificates. It installs the tool under
 `/usr/local/lib/simple-cert/` and creates `/usr/local/bin/simple-cert`. Running the installer again
 preserves saved credentials and certificates. Runtime Python dependencies: **standard library only**.
+
+Ubuntu releases from 22.04 onward pass the version check, including interim releases. Installation
+requires working distribution package repositories and Python 3.10 or newer. End-of-life releases
+with archived repositories may fail during `apt-get`; the installer does not change your APT sources.
+Both installation stages use the same tested compatibility policy. The original `v0.1.0` tag remains
+unchanged; use the updated command above for newer Ubuntu releases.
+
+Compatibility references: [Ubuntu release cycle](https://ubuntu.com/about/release-cycle),
+[acme.sh platforms and prerequisites](https://github.com/acmesh-official/acme.sh#supported-platforms).
 
 ## First certificate
 

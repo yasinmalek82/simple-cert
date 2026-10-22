@@ -4,6 +4,7 @@
 import hashlib
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -12,13 +13,20 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "v0.1.0"
-SCRIPT_SHA256 = "57f5f5b583dd558ac4f52d23eba9d425b03229e34f07a2227a6590c88fe504a1"
+VERSION = "v0.1.1"
+SCRIPT_SHA256 = "56fd53a80c838bf9837c67d7c39b62fda18ab775415781f59a433c1c6e49daf7"
 SOURCE_URL = f"https://raw.githubusercontent.com/yasinmalek82/simple-cert/{VERSION}/simple_cert.py"
 
 
 class InstallError(Exception):
     pass
+
+
+def supports_system(system_id, version_id):
+    if system_id == "ubuntu":
+        version = re.fullmatch(r"([0-9]{2})\.(04|10)", version_id)
+        return bool(version and int(version[1]) >= 22)
+    return system_id == "debian" and version_id in ("12", "13")
 
 
 def verify_download(data):
@@ -50,7 +58,7 @@ def install_file(source, prefix):
             timeout=30,
             check=False,
         )
-        if result.returncode or result.stdout.strip() != b"simple-cert 0.1.0":
+        if result.returncode or result.stdout.strip() != b"simple-cert 0.1.1":
             raise InstallError("Downloaded program failed its version check. Existing installation retained.")
         os.replace(temporary, installed)
     finally:
@@ -70,13 +78,8 @@ def main():
         if sys.version_info < (3, 10):
             raise InstallError("Python 3.10 or newer is required.")
         release = platform.freedesktop_os_release()
-        if (release.get("ID"), release.get("VERSION_ID")) not in {
-            ("ubuntu", "22.04"),
-            ("ubuntu", "24.04"),
-            ("debian", "12"),
-            ("debian", "13"),
-        }:
-            raise InstallError("Supported systems: Ubuntu 22.04/24.04 and Debian 12/13.")
+        if not supports_system(release.get("ID", ""), release.get("VERSION_ID", "")):
+            raise InstallError("Supported systems: Ubuntu 22.04 or newer, and Debian 12/13.")
         for command in ("sh", "git", "openssl", "curl"):
             if not shutil.which(command):
                 raise InstallError(f"Missing prerequisite: {command}. Use the bootstrap installer.")
@@ -87,11 +90,14 @@ def main():
             source = Path(directory) / "simple_cert.py"
             source.write_bytes(data)
             install_file(source, Path("/usr/local"))
-        print("Installed simple-cert 0.1.0. Existing settings and certificates have been preserved.")
+        print("Installed simple-cert 0.1.1. Existing settings and certificates have been preserved.")
         print("Open the menu: sudo simple-cert")
         print("Run it on the mother server. Certificates are delivered as local files only.")
         return 0
-    except (InstallError, OSError, urllib.error.URLError, subprocess.SubprocessError):
+    except InstallError as error:
+        print(f"Installation failed: {error}", file=sys.stderr)
+        return 1
+    except (OSError, urllib.error.URLError, subprocess.SubprocessError):
         # Network responses and downloaded content are never included in diagnostics.
         print(
             "Installation failed. Check OS support, root access, disk space and GitHub access.",

@@ -18,7 +18,7 @@ import uuid
 import warnings
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 ACME_COMMIT = "3688b094adffc1a52d3b994c586cd97caa2f0b85"
 CA = "https://acme-v02.api.letsencrypt.org/directory"
 MENU = """

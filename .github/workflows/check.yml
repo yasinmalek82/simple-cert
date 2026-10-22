@@ -19,3 +19,19 @@ jobs:
       - run: ruff format --check .
       - run: bash -n install.sh
       - run: python simple_cert.py --version
+  newer-ubuntu-install:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: ["ubuntu:26.04", "ubuntu:26.10"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install and test inside the target Ubuntu container
+        run: |
+          docker run --rm --volume "$PWD:/src:ro" "${{ matrix.image }}" bash -euc '
+            bash /src/install.sh
+            simple-cert --version
+            printf "2\n0\n" | simple-cert --state-dir /tmp/simple-cert-smoke
+            apt-get install -y --no-install-recommends python3-pytest python3-cryptography
+            python3 -m pytest -q -p no:cacheprovider /src/tests
+          '
