@@ -1,0 +1,12 @@
+name: Maintenance acceptance
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  program-maintenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update and uninstall only disposable temporary installations
+        run: sudo python3 tests/maintenance_acceptance.py --live-update

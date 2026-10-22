@@ -14,11 +14,20 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 import uuid
 import warnings
 from pathlib import Path
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
+REPOSITORY = "yasinmalek82/simple-cert"
+LEGACY_RELEASES = {
+    "57f5f5b583dd558ac4f52d23eba9d425b03229e34f07a2227a6590c88fe504a1": "0.1.0",
+    "56fd53a80c838bf9837c67d7c39b62fda18ab775415781f59a433c1c6e49daf7": "0.1.1",
+    "0c6951e490fbf7f198028864ffe54a8185ebe10f680bf4a3ac04ee55ea05896a": "0.1.2",
+    "5831604e33d6b653ed7aa954b334ed09b6ae5a98e5f3ce9874630ff7bfc56557": "0.1.3",
+}
 ACME_COMMIT = "3688b094adffc1a52d3b994c586cd97caa2f0b85"
 CA = "https://acme-v02.api.letsencrypt.org/directory"
 MENU = """
@@ -29,6 +38,8 @@ MENU = """
   2. List certificates and file paths
   3. Renew certificate
   4. Cloudflare settings
+  5. Update simple-cert
+  6. Uninstall simple-cert
   0. Exit
   ------------------------------------------------
 """
@@ -476,16 +487,214 @@ def certificate_menu(manager, record):
             input("Press Enter to return to certificate details...")
 
 
+@contextlib.contextmanager
+def application_lock(prefix):
+    library = prefix / "lib"
+    library.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(library / ".simple-cert.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Error("Another installation or uninstall is running. Try again later.") from None
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def identify_installation(candidate):
+    """Recognize our installed layout by manifest digest or exact historical release bytes."""
+    try:
+        script = Path(candidate).resolve(strict=True)
+        if (
+            script.name != "simple_cert.py"
+            or script.parent.name != "simple-cert"
+            or script.parent.parent.name != "lib"
+            or script.stat().st_size > 2 * 1024 * 1024
+        ):
+            return None
+        digest = hashlib.sha256(script.read_bytes()).hexdigest()
+        marker = script.parent / "installation.json"
+        if marker.exists():
+            if marker.is_symlink():
+                return None
+            metadata = json.loads(marker.read_text())
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("application") != "simple-cert"
+                or metadata.get("sha256") != digest
+            ):
+                return None
+            version = metadata.get("version", "")
+        else:
+            version = LEGACY_RELEASES.get(digest, "")
+        if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+            return None
+        prefix = script.parents[2]
+        command = prefix / "bin/simple-cert"
+        commands = [command] if command.is_symlink() and command.resolve() == script else []
+        return {
+            "script": script,
+            "prefix": prefix,
+            "version": version,
+            "sha256": digest,
+            "commands": commands,
+        }
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def candidate_scripts():
+    candidates = [Path(__file__)]
+    for prefix in (Path("/usr/local"), Path("/usr"), Path.home() / ".local"):
+        candidates.append(prefix / "lib/simple-cert/simple_cert.py")
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if directory:
+            candidates.append(Path(directory) / "simple-cert")
+    return candidates
+
+
+def discover_installations():
+    copies = {}
+    for candidate in candidate_scripts():
+        identified = identify_installation(candidate)
+        if identified is None:
+            continue
+        script = identified["script"]
+        if script not in copies:
+            copies[script] = identified
+        candidate = Path(candidate).absolute()
+        if candidate.name == "simple-cert" and candidate.is_symlink():
+            if candidate not in copies[script]["commands"]:
+                copies[script]["commands"].append(candidate)
+    return list(copies.values())
+
+
+def remove_installation(installation):
+    with application_lock(installation["prefix"]):
+        current = identify_installation(installation["script"])
+        if current is None or current["sha256"] != installation["sha256"]:
+            raise Error("The selected installation changed after discovery; it was not removed.")
+        script = current["script"]
+        for command in installation["commands"]:
+            if command.is_symlink() and command.resolve() == script:
+                command.unlink()
+        script.unlink()
+        (script.parent / "installation.json").unlink(missing_ok=True)
+        # Preserve unknown files, private state and all certificate versions. Never recurse.
+        with contextlib.suppress(OSError):
+            script.parent.rmdir()
+        print(f"Removed simple-cert {current['version']}: {script}")
+
+
+def uninstall_menu(manager):
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise Error("Uninstall requires an interactive terminal.")
+    current_script = Path(__file__).resolve()
+    copies = discover_installations()
+    current = next((item for item in copies if item["script"] == current_script), None)
+    if current is None:
+        raise Error("This is not a recognized installed copy. Run the installed simple-cert command.")
+    others = [item for item in copies if item["script"] != current_script]
+    print(f"\nCurrent installation: {current['version']} | {current_script}")
+    print(f"Settings, ACME data and all certificates will be kept at: {manager.root}")
+    if input("Remove this program? Type uninstall: ").strip().lower() != "uninstall":
+        print("Uninstall cancelled.")
+        return False
+    selected = [current]
+    if others:
+        print("\nOther recognized simple-cert installations:")
+        for item in others:
+            print(f"  {item['version']} | {item['script']}")
+        if input("Remove these other installations too? [y/N]: ").strip().lower() in ("y", "yes"):
+            selected = [*others, current]
+    with locked(manager.root):
+        for item in selected:
+            remove_installation(item)
+    print("Uninstall complete. Settings and certificates were preserved.")
+    return True
+
+
+def download(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "simple-cert/" + VERSION})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = response.read(2 * 1024 * 1024 + 1)
+        if len(data) > 2 * 1024 * 1024:
+            raise Error("Update response is too large. No installation changes made.")
+        return data
+    except (OSError, urllib.error.URLError):
+        raise Error(
+            "Cannot check GitHub for updates. Check connectivity and public API rate limits."
+        ) from None
+
+
+def update_menu(manager):
+    installation = identify_installation(Path(__file__))
+    if installation is None:
+        raise Error("Update is available from an installed copy. Run the installed simple-cert command.")
+    if os.geteuid() != 0:
+        raise Error("Run sudo simple-cert to update the installed program.")
+    print("Checking the latest stable GitHub release...")
+    try:
+        release = json.loads(download(f"https://api.github.com/repos/{REPOSITORY}/releases/latest"))
+        tag = release["tag_name"]
+        match = re.fullmatch(r"v([0-9]{1,6})\.([0-9]{1,6})\.([0-9]{1,6})", tag)
+        if not match or release["draft"] is not False or release["prerelease"] is not False:
+            raise ValueError
+        newest = tuple(int(value) for value in match.groups())
+        if newest <= tuple(int(value) for value in VERSION.split(".")):
+            print(f"Already up to date: simple-cert {VERSION}.")
+            return False
+        assets = release["assets"]
+        digest = next(item["digest"] for item in assets if item["name"] == "installer.py")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise ValueError
+    except (ValueError, KeyError, TypeError, StopIteration):
+        raise Error("GitHub returned unsupported release metadata. No installation changes made.") from None
+    print(f"Current: {VERSION} -> Available: {tag}")
+    print("The existing program will be replaced in place. Settings and all certificates are preserved.")
+    if input("Install this update? Type yes: ").strip().lower() != "yes":
+        print("Update cancelled.")
+        return False
+    data = download(f"https://raw.githubusercontent.com/{REPOSITORY}/{tag}/installer.py")
+    if "sha256:" + hashlib.sha256(data).hexdigest() != digest:
+        raise Error("Installer checksum verification failed. Existing program retained.")
+    with locked(manager.root), tempfile.TemporaryDirectory(prefix="simple-cert-update-") as directory:
+        current = identify_installation(installation["script"])
+        if current is None or current["sha256"] != installation["sha256"]:
+            raise Error(
+                "The installation changed while downloading. Update cancelled; inspect it before retrying."
+            )
+        installer = Path(directory) / "installer.py"
+        installer.write_bytes(data)
+        run(
+            [sys.executable, str(installer), "--prefix", str(installation["prefix"])],
+            message="Update did not complete. Inspect the installed version before retrying; private state is preserved.",
+        )
+        result = run([sys.executable, str(installation["script"]), "--version"])
+        if result.stdout.strip() != ("simple-cert " + tag.removeprefix("v")).encode():
+            raise Error("The installed version did not match the release. Inspect it before retrying.")
+    print(f"Updated to {tag}. Run simple-cert again to load the new version.")
+    return True
+
+
 def menu(manager):
     while True:
         interactive = clear_screen()
         print(MENU)
         try:
-            choice = input("Choose [0-4]: ").strip()
+            choice = input("Choose [0-6]: ").strip()
             if choice == "0":
                 return
             if choice == "4":
                 settings_menu(manager)
+            elif choice == "5":
+                if update_menu(manager):
+                    return
+            elif choice == "6":
+                if uninstall_menu(manager):
+                    return
             elif choice == "1":
                 if not (manager.root / "settings.json").exists():
                     settings_menu(manager)
@@ -523,7 +732,7 @@ def menu(manager):
                         print("The ACME client renews only when due; no forced renewal is performed.")
                         show(manager, manager.renew(selected["id"]))
             else:
-                print("Invalid choice. Choose a number from 0 to 4.")
+                print("Invalid choice. Choose a number from 0 to 6.")
         except Error as error:
             print(f"\nError: {error}")
         except KeyboardInterrupt:

@@ -5,7 +5,7 @@ Get a Let's Encrypt certificate through Cloudflare DNS, even when your domain po
 **Quick install** — Ubuntu 22.04 or newer (including 26.04/26.10), or Debian 12/13, on the mother server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.3/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.4/install.sh | sudo bash
 ```
 
 Then open the interactive menu:
@@ -58,6 +58,8 @@ control sequences or extra Enter prompts.
 2. List certificates and file paths
 3. Renew certificate
 4. Cloudflare settings
+5. Update simple-cert
+6. Uninstall simple-cert
 0. Exit
 ```
 
@@ -74,6 +76,32 @@ Copy only the PEM block between the `BEGIN` and `END` markers, including those m
 Private keys require both an interactive input/output terminal and an explicit `yes` confirmation;
 they cannot be displayed through redirected output. Viewing a key leaves it in terminal scrollback,
 so use a private, unrecorded session. No file contents are added to application state or logs.
+
+## Update and uninstall
+
+Choose **5** to check the latest stable published GitHub release. Run the installed tool as root.
+After you confirm with `yes`, the updater verifies the installer against GitHub's release-asset
+SHA-256 digest; the installer also verifies the application checksum. The program is replaced in
+the same location, with no directory per program version. The installed version is checked before
+success is reported. The menu then exits; run `simple-cert` again to load the update.
+Settings, ACME accounts, keys and all certificate versions are kept. A failed download or checksum
+check leaves the existing installation in place. If an installation fails after replacement, inspect
+`simple-cert --version` before retrying or rerun the bootstrap installer to repair it.
+
+Choose **6** to uninstall. The menu shows the current program's version and path and asks you to
+type `uninstall`. If it detects other recognized installations, it lists their versions and paths
+and asks separately whether to remove them too; the default is to keep them. Cancelling the first
+confirmation removes nothing. Uninstall preserves private state and certificates, including files
+that may already be used by a service. It does not remove Python, OpenSSL or other system packages.
+
+Discovery checks the running copy, the standard `/usr/local`, `/usr` and `~/.local` installation
+prefixes, plus `simple-cert` commands on `PATH`. Recognition uses a matching installation manifest
+or the exact published application hashes for versions 0.1.0 through 0.1.3. Source checkouts,
+modified/unrecognized copies and unrelated files are left in place. The tool does not scan the
+entire filesystem. Cleanup removes only recognized program files and their matching command links;
+unknown files inside an installation directory are retained. The uninstall menu requires a terminal.
+
+For releases older than 0.1.4, run the quick-install command above once to gain the Update menu.
 
 ## Files and privacy
 
@@ -123,6 +151,7 @@ python3 -m venv .venv
 .venv/bin/ruff format --check .
 bash -n install.sh
 python3 simple_cert.py --help
+python3 tests/maintenance_acceptance.py
 ```
 
 Tests generate disposable certificates and substitute only external ACME/network boundaries. They do
@@ -130,3 +159,9 @@ not use real Cloudflare credentials, request public certificates or change syste
 smoke checks use a temporary installation prefix and verify reinstall behavior. Live CA issuance and
 the supported Linux deployment targets require separate runtime acceptance; offline tests do not
 prove a real Cloudflare/CA transaction.
+
+The maintenance acceptance script uses only disposable installation prefixes and dummy preservation
+markers. Its default mode checks the real terminal uninstall flow without network access.
+The manually dispatched `Maintenance acceptance` workflow additionally exercises a real public
+GitHub update as root into a temporary prefix, followed by uninstall; it never changes the runner's
+system installation or uses Cloudflare credentials.

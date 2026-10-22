@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Pinned release installer; does not read or overwrite certificate state."""
 
+import argparse
+import contextlib
+import fcntl
 import hashlib
+import json
 import os
 import platform
 import re
@@ -13,8 +17,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "v0.1.3"
-SCRIPT_SHA256 = "5831604e33d6b653ed7aa954b334ed09b6ae5a98e5f3ce9874630ff7bfc56557"
+VERSION = "v0.1.4"
+SCRIPT_SHA256 = "2baf69313f14ec3fd265dc5c99c0873c072491514375b622992f5d5d586ec982"
 SOURCE_URL = f"https://raw.githubusercontent.com/yasinmalek82/simple-cert/{VERSION}/simple_cert.py"
 
 
@@ -34,9 +38,31 @@ def verify_download(data):
         raise InstallError("Release checksum verification failed. Existing installation retained.")
 
 
+@contextlib.contextmanager
+def install_lock(prefix):
+    library = prefix / "lib"
+    library.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(library / ".simple-cert.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise InstallError("Another installation or uninstall is running.") from None
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def install_file(source, prefix):
+    with install_lock(prefix):
+        _install_file(source, prefix)
+
+
+def _install_file(source, prefix):
     target = prefix / "lib/simple-cert"
     commands = prefix / "bin"
+    if target.is_symlink():
+        raise InstallError("The program directory must not be a symbolic link.")
     target.mkdir(parents=True, exist_ok=True)
     commands.mkdir(parents=True, exist_ok=True)
     command = commands / "simple-cert"
@@ -58,7 +84,7 @@ def install_file(source, prefix):
             timeout=30,
             check=False,
         )
-        if result.returncode or result.stdout.strip() != b"simple-cert 0.1.3":
+        if result.returncode or result.stdout.strip() != b"simple-cert 0.1.4":
             raise InstallError("Downloaded program failed its version check. Existing installation retained.")
         os.replace(temporary, installed)
     finally:
@@ -69,9 +95,29 @@ def install_file(source, prefix):
         os.replace(temporary_link, command)
     finally:
         temporary_link.unlink(missing_ok=True)
+    metadata = {
+        "application": "simple-cert",
+        "version": VERSION.removeprefix("v"),
+        "sha256": hashlib.sha256(installed.read_bytes()).hexdigest(),
+    }
+    descriptor, name = tempfile.mkstemp(prefix=".manifest-", dir=target)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(metadata, stream)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o644)
+        os.replace(temporary, target / "installation.json")
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Install a pinned simple-cert release.")
+    parser.add_argument("--prefix", type=Path, default=Path("/usr/local"))
+    args = parser.parse_args()
     try:
         if platform.system() != "Linux" or os.geteuid() != 0:
             raise InstallError("Run the installer as root on the Linux mother server.")
@@ -89,8 +135,8 @@ def main():
         with tempfile.TemporaryDirectory(prefix="simple-cert-install-") as directory:
             source = Path(directory) / "simple_cert.py"
             source.write_bytes(data)
-            install_file(source, Path("/usr/local"))
-        print("Installed simple-cert 0.1.3. Existing settings and certificates have been preserved.")
+            install_file(source, args.prefix.expanduser().absolute())
+        print("Installed simple-cert 0.1.4. Existing settings and certificates have been preserved.")
         print("Open the menu: sudo simple-cert")
         print("Run it on the mother server. Certificates are delivered as local files only.")
         return 0
