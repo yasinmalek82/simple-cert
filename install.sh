@@ -10,7 +10,7 @@ supports_system() {
 }
 
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
-    echo 'Install simple-cert v0.1.9 on Ubuntu 22.04 or newer, or Debian 12/13.'
+    echo 'Install simple-cert v0.1.10 on Ubuntu 22.04 or newer, or Debian 12/13.'
     echo 'Run as root on the mother server. No services or renewal timers are configured.'
     echo 'Read-only compatibility check: --check-system ID VERSION_ID'
     exit 0
@@ -36,12 +36,12 @@ fi
 
 echo 'Installing prerequisites for simple-cert...'
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 git openssl curl ca-certificates
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 git openssl curl ca-certificates tzdata
 
 work_dir="$(mktemp -d)"
 trap 'rm -rf -- "$work_dir"' EXIT
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
     --connect-timeout 15 --max-time 120 \
-    'https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.9/installer.py' \
+    'https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.10/installer.py' \
     --output "$work_dir/installer.py"
 python3 "$work_dir/installer.py"

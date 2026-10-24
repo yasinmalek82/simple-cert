@@ -122,10 +122,10 @@ def test_status_handles_missing_files_without_guessing_public_url(app, installed
 def test_option_seven_shows_readonly_status_before_prompt(app, tmp_path, monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(app, "show_panel_https_status", lambda: calls.append("status"))
-    values = iter(["7", "0", "0"])
+    values = iter(["2", "0", "0"])
 
     def answer(prompt):
-        if prompt == "Choose [0-4]: ":
+        if prompt == "Choose [0-5]: ":
             assert calls == ["status"]
         return next(values)
 
@@ -247,7 +247,7 @@ def test_status_scan_failure_does_not_block_panel_menu(app, tmp_path, monkeypatc
         raise PermissionError("secret-fixture")
 
     monkeypatch.setattr(app, "renewal_jobs", unavailable)
-    values = iter(["7", "0", "0"])
+    values = iter(["2", "0", "0"])
     monkeypatch.setattr("builtins.input", lambda _: next(values))
     app.menu(app.Manager(tmp_path / "state"))
     output = capsys.readouterr().out
@@ -264,7 +264,7 @@ def test_panel_status_refresh_is_explicit_and_menu_redraw_uses_cached_report(app
 
     monkeypatch.setattr(app, "show_panel_https_status", report)
     monkeypatch.setattr(app, "clear_screen", lambda: False)
-    values = iter(["7", "2", "4", "0", "0"])
+    values = iter(["2", "2", "5", "0", "0"])
     monkeypatch.setattr("builtins.input", lambda _: next(values))
     app.menu(app.Manager(tmp_path / "state"))
     assert calls == ["scan", "scan"]

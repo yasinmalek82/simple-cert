@@ -52,8 +52,10 @@ def terminal_uninstall(script, other, state, remove_others):
             output += os.read(master, 65536)
 
     try:
-        until(b"Choose [0-7]:")
-        os.write(master, b"6\n")
+        until(b"Choose [0-4]:")
+        os.write(master, b"4\n")
+        until(b"Choose utility action:")
+        os.write(master, b"2\n")
         until(b"Type uninstall:")
         os.write(master, b"uninstall\n")
         until(b"Remove these other installations too?")
@@ -99,7 +101,7 @@ def main():
             (script.parent / "installation.json").write_text(json.dumps(metadata))
             result = subprocess.run(
                 [sys.executable, str(script), "--state-dir", str(state)],
-                input=b"5\nyes\n",
+                input=b"4\n1\nyes\n",
                 capture_output=True,
                 timeout=180,
                 check=True,

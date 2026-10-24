@@ -5,6 +5,7 @@ permissions:
 jobs:
   offline-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
         python-version: ["3.10", "3.13"]
@@ -21,21 +22,24 @@ jobs:
       - run: ruff format --check .
       - run: bash -n install.sh
       - run: python simple_cert.py --version
-  newer-ubuntu-install:
+  supported-linux-install:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        image: ["ubuntu:26.04", "ubuntu:26.10"]
+        image: ["ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04", "ubuntu:26.10", "debian:12", "debian:13"]
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Install and test inside the target Ubuntu container
+      - name: Install and test inside the target Linux container
         run: |
-          docker run --rm --volume "$PWD:/src:ro" "${{ matrix.image }}" bash -euc '
-            bash /src/install.sh
+          docker run --rm --workdir /src --env PYTHONDONTWRITEBYTECODE=1 --volume "$PWD:/src:ro" "${{ matrix.image }}" bash -euc '
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 git openssl curl ca-certificates tzdata python3-pytest python3-cryptography
+            python3 -c "from pathlib import Path; import installer; installer.verify_download(Path(\"simple_cert.py\").read_bytes()); installer.install_file(Path(\"simple_cert.py\"), Path(\"/usr/local\"))"
             simple-cert --version
-            printf "2\n0\n" | simple-cert --state-dir /tmp/simple-cert-smoke
-            apt-get install -y --no-install-recommends python3-pytest python3-cryptography
+            printf "1\n2\n0\n0\n" | simple-cert --state-dir /tmp/simple-cert-smoke
             python3 -m pytest -q -p no:cacheprovider /src/tests
           '

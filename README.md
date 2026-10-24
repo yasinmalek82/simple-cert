@@ -2,10 +2,14 @@
 
 Get a Let's Encrypt certificate through Cloudflare DNS, even when your domain points to a different server.
 
+Version **0.1.10** adds opt-in scheduled file renewal. Installing or updating the program does
+not enroll certificates or enable a timer automatically.
+Activation of Core/node TLS and panel HTTPS remains manual. See [automation and recovery](AUTOMATION.md).
+
 **Quick install** — Ubuntu 22.04 or newer (including 26.04/26.10), or Debian 12/13, on the mother server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.9/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.10/install.sh | sudo bash
 ```
 
 Then open the interactive menu:
@@ -32,7 +36,7 @@ Compatibility references: [Ubuntu release cycle](https://ubuntu.com/about/releas
 
 ## First certificate
 
-1. Choose **Issue certificate**. On first use, the menu asks for your email and Cloudflare API token.
+1. Choose **1. Node/config certificates → 1. Issue certificate**. On first use, the menu asks for your email and Cloudflare API token.
 2. Use a Cloudflare token with **Zone / DNS / Edit** and **Zone / Zone / Read**, restricted to the
    required zone(s). Enter it only at the hidden terminal prompt.
 3. Enter `vpn.example.com`, `example.com` or `*.example.com`. For a normal domain, you can also include
@@ -56,33 +60,43 @@ preserved. Redirected output and terminals with an unset or `dumb` TERM stay pla
 control sequences or extra Enter prompts.
 
 ```text
-1. Issue node/config certificate
-2. List node/config certificates and file paths
-3. Renew node/config certificate
-4. Cloudflare settings
-5. Update simple-cert
-6. Uninstall simple-cert
-7. Panel HTTPS certificates (separate files)
+1. Node/config certificates
+2. Panel HTTPS certificates
+3. Settings and automation
+4. Program maintenance
 0. Exit
 ```
 
-Renewal is **manual**. Choose option 3 periodically; acme.sh decides whether the certificate is due.
-The tool does not force unnecessary renewals. A failed initial request remains in the list and can
-be retried through option 3. A duplicate domain set is directed to renewal instead of another issue.
-There are no cron jobs, systemd timers, panel API calls, service reloads or node operations.
+Each certificate section offers issuance, listing and manual renewal. Select a saved
+certificate to view expiry, days remaining, version count, retained bytes, source and delivery
+paths, and the latest operation/automatic-check result. Certificate details provide:
 
-To view file contents, choose **2**, select a certificate by its number, then choose
-**View fullchain.pem** or **View key.pem**. The viewer shows the selected certificate's published
-files and returns to certificate details after Enter. Choose **0** to return to the main menu.
-Copy only the PEM block between the `BEGIN` and `END` markers, including those markers.
+- View fullchain or private key (key display requires a terminal and explicit consent).
+- Publish/change Core delivery paths, or retry registered deliveries without contacting the CA.
+- Renew manually; unchanged PEMs keep their existing version and paths.
+- Enable/disable automatic renewal **for this certificate only**.
+- Reconcile an interrupted operation using local evidence before making another CA request.
 
-Private keys require both an interactive input/output terminal and an explicit `yes` confirmation;
-they cannot be displayed through redirected output. Viewing a key leaves it in terminal scrollback,
-so use a private, unrecorded session. No file contents are added to application state or logs.
+Automatic renewal is disabled by default. Enabling a certificate explicitly installs/enables a
+root systemd timer for this recognized installation and state directory. It checks at 04:00
+Asia/Tehran, with later retry opportunities at 04:10 and 04:20. The ACME client decides whether
+renewal is due; no forced issuance is performed. Telegram settings are under **3. Settings and
+automation**. See [the operating contract](AUTOMATION.md) for failure and recovery details.
+
+For manual renewal, choose the section's **3. Renew certificate manually**, or **4. Renew manually**
+in certificate details. Failed initial issuance can be retried unless its outcome is unknown.
+Duplicate domain sets are directed to their existing record. The tool never calls the panel API,
+restarts/reloads a panel/node, or changes Core configuration. Some consumers may read updated
+files automatically; file publication cannot guarantee that a consumer waits for manual activation.
+
+To copy PEM contents, open the section's certificate list, select a certificate, and choose
+**View fullchain.pem** or **View key.pem**. Copy the complete PEM block, including BEGIN/END markers.
+Private keys cannot be displayed through redirected output. Key display leaves the key in terminal
+scrollback: use a private, unrecorded session. Contents are never saved in application logs.
 
 ## Update and uninstall
 
-Choose **5** to check the latest stable published GitHub release. Run the installed tool as root.
+Choose **4. Program maintenance → 1. Update simple-cert** to check the latest stable published GitHub release. Run the installed tool as root.
 After you confirm with `yes`, the updater verifies the installer against GitHub's release-asset
 SHA-256 digest; the installer also verifies the application checksum. The program is replaced in
 the same location, with no directory per program version. The installed version is checked before
@@ -91,10 +105,10 @@ Settings, ACME accounts, keys and all certificate versions are kept. A failed do
 check leaves the existing installation in place. If an installation fails after replacement, inspect
 `simple-cert --version` before retrying or rerun the bootstrap installer to repair it.
 
-Choose **6** to uninstall. The menu shows the current program's version and path and asks you to
+Choose **4. Program maintenance → 2. Uninstall simple-cert** to uninstall. The menu shows the current program's version and path and asks you to
 type `uninstall`. If it detects other recognized installations, it lists their versions and paths
 and asks separately whether to remove them too; the default is to keep them. Cancelling the first
-confirmation removes nothing. Uninstall preserves private state and certificates, including files
+confirmation removes nothing. Uninstall first stops/removes the timer and worker owned by the selected installation. It preserves private state and certificates, including files
 that may already be used by a service. It does not remove Python, OpenSSL or other system packages.
 
 Discovery checks the running copy, the standard `/usr/local`, `/usr` and `~/.local` installation
@@ -123,7 +137,7 @@ New certificate folders include the first domain and a stable identifier, for ex
 The identifier distinguishes certificates with different domain sets. Domain labels longer than
 200 characters are shortened to fit filesystem limits. Existing hash-only folders and registered
 panel delivery paths remain unchanged and continue to renew. For an existing certificate, choose
-**2 → select certificate → 3** and accept the new domain-based default to publish a readable panel path;
+**1. Node/config certificates → 2. List → select certificate → 3** and accept the new domain-based default to publish a readable panel path;
 then update the paths in your Core manually. Earlier paths remain available and are also renewed.
 
 The current link switches both files together only after checking the key match, requested DNS names
@@ -180,7 +194,7 @@ system installation or uses Cloudflare credentials.
 ## Node/config Core file delivery through the mother panel
 
 Run simple-cert on the **mother panel host**. After node/config issuance, a detected local PasarGuard
-container offers an optional Core file delivery prompt. You can also use **2 → select certificate → 3**
+container offers an optional Core file delivery prompt. You can also use **1. Node/config certificates → 2. List → select certificate → 3**
 to publish later or choose another directory. Confirm the displayed host and container filesystem paths
 by typing `yes`. The default directory inside the panel is:
 
@@ -219,11 +233,11 @@ renewal publication. It does not run a production PasarGuard panel or issue real
 
 ## Panel HTTPS certificates: a separate section
 
-Choose **7** in the main menu for the website/dashboard certificate, separate from the
+Choose **2. Panel HTTPS certificates** in the main menu for the website/dashboard certificate, separate from the
 certificates used for node/config Core TLS. This submenu supports **1: issue**, **2: list and
-view PEM files**, **3: manual renewal**, **4: refresh current HTTPS status**, and **0: return**.
+view PEM files**, **3: manual renewal**, **4: detailed current HTTPS report**, **5: refresh status**, and **0: return**.
 Its files, ACME client state and certificate list are isolated under `<state>/panel-https/`. The Cloudflare account settings
-from main-menu option 4 are shared. You can use a different domain for the panel.
+from **3. Settings and automation → 1. Cloudflare settings** are shared. You can use a different domain for the panel.
 
 An existing certificate configured manually in PasarGuard's `.env` is not imported or
 replaced. The tool does not edit `.env`, change SSL environment settings, adopt existing
@@ -242,7 +256,7 @@ before the `yes` confirmation publishes no certificate files to the selected des
 
 ## Inspecting the existing panel HTTPS certificate
 
-Opening **7** first shows a read-only report for the existing panel configuration, including
+Opening **2. Panel HTTPS certificates** first shows a read-only report for the existing panel configuration, including
 certificate DNS names, expiry in UTC, days remaining, the configured certificate/key paths,
 and host mount mappings. Read-only mounts and normal certificate live/archive symlinks are
 supported. Certificate metadata is decoded with OpenSSL; the status inspector does not read
@@ -272,7 +286,7 @@ referenced by recognized jobs. Only direct clients and simple env/shell wrappers
 Custom scripts, unusual homes, other containers/users, global deploy hooks and incomplete access
 can prevent attribution. It does not execute renewal clients, hooks, inspected commands or services.
 The systemd scan is bounded and unavailable/partial inspection is indicated. Reports are cached
-while the submenu is open; choose **4** to refresh. Root is recommended for complete read access.
+while the submenu is open; choose **4** for the full report or **5** to refresh. Root is recommended for complete read access.
 
 The current [official PasarGuard installer](https://github.com/PasarGuard/scripts/blob/main/pasarguard.sh)
 uses acme.sh for its Let's Encrypt setup, installs a cron renewal job and registers a reload hook.

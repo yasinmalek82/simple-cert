@@ -16,6 +16,7 @@ def command(*args):
 def main():
     if os.geteuid() != 0:
         raise RuntimeError("Run in a disposable rootful Docker CI runner as root")
+    os.umask(0o077)
     source = Path(__file__).resolve().parents[1] / "simple_cert.py"
     spec = importlib.util.spec_from_file_location("app", source)
     app = importlib.util.module_from_spec(spec)
@@ -29,6 +30,9 @@ def main():
         root.chmod(0o755)
         data = root / "data"
         data.mkdir(mode=0o755)
+        # This fixture represents an existing traversable panel mount. Keep the
+        # restrictive CLI umask for managed publication, not fixture scaffolding.
+        data.chmod(0o755)
         pair = root / "pair"
         pair.mkdir()
         command(
@@ -51,6 +55,7 @@ def main():
         )
         initial = data / "initial-panel-cert"
         initial.mkdir(mode=0o755)
+        initial.chmod(0o755)
         for filename in ("fullchain.pem", "key.pem"):
             destination = initial / filename
             shutil.copyfile(pair / filename, destination)
@@ -97,6 +102,26 @@ def main():
             previous = current.resolve()
             assert (current / "key.pem").stat().st_uid == 1000
             assert (current / "key.pem").stat().st_mode & 0o777 == 0o600
+            record = manager.renew(record["id"])
+            assert current.resolve() == previous and previous.exists()
+            command(
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "31",
+                "-subj",
+                "/CN=example.com",
+                "-addext",
+                "subjectAltName=DNS:example.com",
+                "-keyout",
+                str(pair / "key.pem"),
+                "-out",
+                str(pair / "fullchain.pem"),
+            )
             record = manager.renew(record["id"])
             assert current.resolve() != previous and previous.exists()
             assert record["deliveries"][0]["status"] == "complete"

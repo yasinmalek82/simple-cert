@@ -17,8 +17,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "v0.1.9"
-SCRIPT_SHA256 = "f9399006ec8ed5f46c44db4d0c92d504f75d27e38239fd34bd4985bc2bbfd527"
+VERSION = "v0.1.10"
+SCRIPT_SHA256 = "0ce0dfaeb223bc153da410ddbb02e48a1cb9d64839ac3d784cc21af6fa3e6f22"
 SOURCE_URL = f"https://raw.githubusercontent.com/yasinmalek82/simple-cert/{VERSION}/simple_cert.py"
 
 
@@ -70,48 +70,67 @@ def _install_file(source, prefix):
     if command.exists() or command.is_symlink():
         if not command.is_symlink() or command.resolve() != installed.resolve():
             raise InstallError("A different simple-cert command already exists. No replacement performed.")
-    descriptor, name = tempfile.mkstemp(prefix=".install-", dir=target)
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
+    manifest = target / "installation.json"
+    for path in (installed, manifest):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise InstallError("Installed program and manifest must be regular files.")
+    # Stage and validate everything before replacing any installed file. Backups
+    # stay on the same filesystem so a caught publication failure can roll back
+    # with rename even when no space remains for another copy.
+    with tempfile.TemporaryDirectory(prefix=".install-", dir=target) as directory:
+        staging = Path(directory)
+        program = staging / "program"
+        with program.open("wb") as stream:
             stream.write(source.read_bytes())
             stream.flush()
             os.fsync(stream.fileno())
-        temporary.chmod(0o755)
+        program.chmod(0o755)
         result = subprocess.run(
-            [sys.executable, str(temporary), "--version"],
+            [sys.executable, str(program), "--version"],
             capture_output=True,
             timeout=30,
             check=False,
         )
-        if result.returncode or result.stdout.strip() != b"simple-cert 0.1.9":
+        if result.returncode or result.stdout.strip() != b"simple-cert 0.1.10":
             raise InstallError("Downloaded program failed its version check. Existing installation retained.")
-        os.replace(temporary, installed)
-    finally:
-        temporary.unlink(missing_ok=True)
-    temporary_link = commands / f".simple-cert-{os.getpid()}"
-    try:
-        temporary_link.symlink_to(installed.absolute())
-        os.replace(temporary_link, command)
-    finally:
-        temporary_link.unlink(missing_ok=True)
-    metadata = {
-        "application": "simple-cert",
-        "version": VERSION.removeprefix("v"),
-        "sha256": hashlib.sha256(installed.read_bytes()).hexdigest(),
-    }
-    descriptor, name = tempfile.mkstemp(prefix=".manifest-", dir=target)
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "w") as stream:
+        metadata = {
+            "application": "simple-cert",
+            "version": VERSION.removeprefix("v"),
+            "sha256": hashlib.sha256(program.read_bytes()).hexdigest(),
+        }
+        staged_manifest = staging / "manifest"
+        with staged_manifest.open("w") as stream:
             json.dump(metadata, stream)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        temporary.chmod(0o644)
-        os.replace(temporary, target / "installation.json")
-    finally:
-        temporary.unlink(missing_ok=True)
+        staged_manifest.chmod(0o644)
+        backups = {}
+        for path in (installed, manifest):
+            backup = staging / (path.name + ".previous") if path.exists() else None
+            if backup:
+                shutil.copy2(path, backup)
+            backups[path] = backup
+        temporary_link = commands / f".simple-cert-{os.getpid()}"
+        replaced = []
+        try:
+            for staged, destination in ((program, installed), (staged_manifest, manifest)):
+                os.replace(staged, destination)
+                replaced.append(destination)
+            # An existing correct link already follows the replaced program.
+            if not command.is_symlink():
+                temporary_link.symlink_to(installed.absolute())
+                os.replace(temporary_link, command)
+        except BaseException:
+            for path in reversed(replaced):
+                backup = backups[path]
+                if backup is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    os.replace(backup, path)
+            raise
+        finally:
+            temporary_link.unlink(missing_ok=True)
 
 
 def main():
@@ -136,7 +155,7 @@ def main():
             source = Path(directory) / "simple_cert.py"
             source.write_bytes(data)
             install_file(source, args.prefix.expanduser().absolute())
-        print("Installed simple-cert 0.1.9. Existing settings and certificates have been preserved.")
+        print("Installed simple-cert 0.1.10. Existing settings and certificates have been preserved.")
         print("Open the menu: sudo simple-cert")
         print("Run it on the mother server. Certificates are delivered as local files only.")
         return 0

@@ -62,10 +62,10 @@ def test_install_and_reinstall_preserve_private_state(tmp_path):
         module.install_file(ROOT / "simple_cert.py", prefix)
         result = subprocess.run([str(prefix / "bin/simple-cert"), "--version"], capture_output=True)
         assert result.returncode == 0
-        assert result.stdout.strip() == b"simple-cert 0.1.9"
+        assert result.stdout.strip() == b"simple-cert 0.1.10"
         result = subprocess.run(
             [str(prefix / "bin/simple-cert"), "--state-dir", str(state)],
-            input=b"2\n0\n",
+            input=b"1\n2\n0\n0\n",
             capture_output=True,
             cwd=tmp_path,
         )
@@ -104,3 +104,56 @@ def test_malformed_upgrade_retains_installed_program(tmp_path):
     with pytest.raises(module.InstallError):
         module.install_file(source, prefix)
     assert (prefix / "bin/simple-cert").read_bytes() == old
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_late_install_failure_restores_program_manifest_and_command(tmp_path, monkeypatch, existing):
+    spec = importlib.util.spec_from_file_location("installer", ROOT / "installer.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    prefix = tmp_path / "prefix"
+    if existing:
+        module.install_file(ROOT / "simple_cert.py", prefix)
+    target = prefix / "lib/simple-cert"
+    installed = target / "simple_cert.py"
+    manifest = target / "installation.json"
+    command = prefix / "bin/simple-cert"
+    before = {path: path.read_bytes() if path.exists() else None for path in (installed, manifest)}
+    source = tmp_path / "updated.py"
+    source.write_bytes((ROOT / "simple_cert.py").read_bytes() + b"\n# updated fixture\n")
+    replace = module.os.replace
+
+    def fail_manifest(source, destination):
+        if Path(destination) == manifest:
+            raise OSError("Fixture: manifest publication failed")
+        return replace(source, destination)
+
+    monkeypatch.setattr(module.os, "replace", fail_manifest)
+    with pytest.raises(OSError):
+        module.install_file(source, prefix)
+    for path, contents in before.items():
+        assert (path.read_bytes() if path.exists() else None) == contents
+    assert command.is_symlink() is existing
+    if existing:
+        assert subprocess.run([str(command), "--version"], capture_output=True).returncode == 0
+
+
+def test_initial_command_link_failure_leaves_no_partial_installation(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("installer", ROOT / "installer.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    prefix = tmp_path / "prefix"
+    command = prefix / "bin/simple-cert"
+    replace = module.os.replace
+
+    def fail_link(source, destination):
+        if Path(destination) == command:
+            raise OSError("Fixture: command publication failed")
+        return replace(source, destination)
+
+    monkeypatch.setattr(module.os, "replace", fail_link)
+    with pytest.raises(OSError):
+        module.install_file(ROOT / "simple_cert.py", prefix)
+    assert not command.is_symlink()
+    assert not (prefix / "lib/simple-cert/simple_cert.py").exists()
+    assert not (prefix / "lib/simple-cert/installation.json").exists()

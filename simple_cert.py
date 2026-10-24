@@ -7,11 +7,13 @@ import datetime as dt
 import fcntl
 import getpass
 import hashlib
+import io
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,8 +23,9 @@ import urllib.request
 import uuid
 import warnings
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERSION = "0.1.9"
+VERSION = "0.1.10"
 REPOSITORY = "yasinmalek82/simple-cert"
 LEGACY_RELEASES = {
     "57f5f5b583dd558ac4f52d23eba9d425b03229e34f07a2227a6590c88fe504a1": "0.1.0",
@@ -32,33 +35,35 @@ LEGACY_RELEASES = {
 }
 ACME_COMMIT = "3688b094adffc1a52d3b994c586cd97caa2f0b85"
 CA = "https://acme-v02.api.letsencrypt.org/directory"
+AUTOMATION_DIR = Path("/etc/simple-cert")
+SYSTEMD_DIR = Path("/etc/systemd/system")
 MENU = f"""
   SIMPLE CERT v{VERSION}
   Cloudflare DNS verification | Let's Encrypt
   ------------------------------------------------
-  1. Issue node/config certificate
-  2. List node/config certificates and file paths
-  3. Renew node/config certificate
-  4. Cloudflare settings
-  5. Update simple-cert
-  6. Uninstall simple-cert
-  7. Panel HTTPS certificates (separate files)
+  1. Node/config certificates
+  2. Panel HTTPS certificates
+  3. Settings and automation
+  4. Program maintenance
   0. Exit
   ------------------------------------------------
 """
-
-
-PANEL_MENU = f"""
-  SIMPLE CERT v{VERSION} | PANEL HTTPS CERTIFICATES
-  ------------------------------------------------
-  1. Issue panel HTTPS certificate
-  2. List panel HTTPS certificates and file paths
-  3. Renew panel HTTPS certificate
-  4. Refresh current panel HTTPS status
+CORE_MENU = """
+  NODE/CONFIG CERTIFICATES
+  1. Issue certificate
+  2. List certificates and file paths
+  3. Renew certificate manually
   0. Back to main menu
-  ------------------------------------------------
-  Separate files only. Existing panel .env, certificates
-  and running HTTPS service are not changed or adopted.
+"""
+PANEL_MENU = """
+  PANEL HTTPS CERTIFICATES
+  1. Issue certificate
+  2. List certificates and file paths
+  3. Renew certificate manually
+  4. Detailed current HTTPS report
+  5. Refresh current HTTPS status
+  0. Back to main menu
+  Separate files only; activation is manual.
 """
 
 
@@ -66,18 +71,40 @@ class Error(Exception):
     """A safe, operator-facing error without raw command output."""
 
 
+class Busy(Error):
+    """An operation lock is already held by another writer."""
+
+
+class OutcomeUnknown(Error):
+    """A side effect may have completed; inspect evidence before retrying."""
+
+
 def run(argv, *, env=None, cwd=None, allowed=(0,), timeout=1800, message=None):
     try:
-        result = subprocess.run(
+        with subprocess.Popen(
             argv,
             env=env,
             cwd=cwd,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        raise Error(message or "Command unavailable or timed out; private output suppressed.") from None
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        ) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except BaseException:
+                # Killing only the shell can leave ACME/curl descendants modifying
+                # DNS or export files after the operation lock has been released.
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+                raise
+            result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        raise OutcomeUnknown(
+            message or "Command timed out; outcome unknown; private output suppressed."
+        ) from None
+    except OSError:
+        raise Error(message or "Command unavailable; private output suppressed.") from None
     if result.returncode not in allowed:
         raise Error(message or "Operation failed; private command output suppressed.")
     return result
@@ -135,10 +162,27 @@ def locked(root):
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise Error("Another simple-cert operation is running. Try again when it finishes.") from None
+            raise Busy("Another simple-cert operation is running. Try again when it finishes.") from None
         yield
     finally:
         os.close(descriptor)
+
+
+@contextlib.contextmanager
+def certificate_lock(manager, identifier):
+    if not isinstance(identifier, str) or not re.fullmatch(CERTIFICATE_ID, identifier):
+        raise Error("Invalid certificate selection.")
+    with locked(manager.root / "certificates" / identifier):
+        yield
+
+
+def pair_digest(folder):
+    try:
+        return hashlib.sha256(
+            b"\0".join((folder / name).read_bytes() for name in ("fullchain.pem", "key.pem"))
+        ).hexdigest()
+    except OSError:
+        return None
 
 
 def normalize_domains(values):
@@ -240,10 +284,19 @@ class Manager:
     def config(self):
         path = self.settings_root / "settings.json"
         if not path.exists():
-            raise Error("Configure Cloudflare settings first (menu option 4).")
+            raise Error(
+                "Configure Cloudflare settings first (Settings and automation > Cloudflare settings)."
+            )
         result = load(path)
-        if not result.get("email") or not result.get("token"):
-            raise Error("Configure Cloudflare settings first (menu option 4).")
+        if (
+            not isinstance(result.get("email"), str)
+            or not isinstance(result.get("token"), str)
+            or not result.get("email")
+            or not result.get("token")
+        ):
+            raise Error(
+                "Configure Cloudflare settings first (Settings and automation > Cloudflare settings)."
+            )
         return result
 
     def configure(self, email, token):
@@ -254,14 +307,15 @@ class Manager:
         with locked(self.settings_root):
             save(self.settings_root / "settings.json", {"email": email, "token": token})
 
-    def harden(self):
-        # acme.sh also saves DNS tokens in its own configuration files.
-        for directory, _, files in os.walk(self.root, followlinks=False):
-            Path(directory).chmod(0o700)
-            for name in files:
-                path = Path(directory) / name
-                if not path.is_symlink():
-                    path.chmod(0o600)
+    def harden(self, homes=()):
+        # Harden only ACME workspaces touched by this operation, never all retained versions.
+        for home in homes:
+            for directory, _, files in os.walk(home, followlinks=False):
+                Path(directory).chmod(0o700)
+                for name in files:
+                    path = Path(directory) / name
+                    if not path.is_symlink():
+                        path.chmod(0o600)
 
     def install_engine(self):
         engine = self.root / "engine"
@@ -271,7 +325,8 @@ class Manager:
             return
         print("Preparing the dedicated ACME client (first use only)...", flush=True)
         with tempfile.TemporaryDirectory(prefix="engine-", dir=self.root) as temporary:
-            source = Path(temporary)
+            source = Path(temporary) / "source"
+            candidate = Path(temporary) / "engine"
             run(["git", "init", str(source)])
             run(
                 [
@@ -292,9 +347,14 @@ class Manager:
             if actual != ACME_COMMIT:
                 raise Error("ACME client revision verification failed.")
             # The engine remains private; it is always invoked through sh, never executed directly.
-            shutil.copytree(source, engine, ignore=shutil.ignore_patterns(".git"))
-            (engine / "revision").write_text(ACME_COMMIT)
-        self.harden()
+            shutil.copytree(source, candidate, ignore=shutil.ignore_patterns(".git"))
+            (candidate / "revision").write_text(ACME_COMMIT)
+            for directory, _, files in os.walk(candidate):
+                Path(directory).chmod(0o700)
+                for name in files:
+                    (Path(directory) / name).chmod(0o600)
+            os.replace(candidate, engine)
+        self.harden((engine,))
 
     def obtain(self, record, destination, renew=False):
         config = self.config()
@@ -322,9 +382,10 @@ class Manager:
             "permissions, zone access, DNS propagation, CAA records and CA rate limits. "
             "Private ACME output is suppressed; existing certificates are retained."
         )
+        completed = False
         try:
             if renew:
-                run(
+                response = run(
                     [*base, "--renew", "-d", record["domains"][0], "--ecc"],
                     env=env,
                     allowed=(0, 2),
@@ -335,12 +396,14 @@ class Manager:
                     [*base, "--register-account", "--accountemail", config["email"]], env=env, message=failure
                 )
                 domains = [item for domain in record["domains"] for item in ("-d", domain)]
-                run(
+                response = run(
                     [*base, "--issue", "--dns", "dns_cf", "--keylength", "ec-256", *domains],
                     env=env,
                     allowed=(0, 2),
                     message=failure,
                 )
+            completed = True
+            record["acme_result"] = "not due" if response.returncode == 2 else "client completed"
             run(
                 [
                     *base,
@@ -360,24 +423,100 @@ class Manager:
             # Never register a published version as an ACME export destination.
             for name in ("fullchain.pem", "key.pem"):
                 shutil.copyfile(export / name, destination / name)
+        except (Error, OSError):
+            if completed:
+                raise OutcomeUnknown(
+                    "ACME completed but export is uncertain; reconcile before retrying."
+                ) from None
+            raise
         finally:
-            self.harden()
+            self.harden((account, cert_home, export))
+
+    def read_record(self, identifier):
+        if not isinstance(identifier, str) or not re.fullmatch(CERTIFICATE_ID, identifier):
+            raise Error("Invalid certificate selection.")
+        path = self.root / "certificates" / identifier / "record.json"
+        if path.is_symlink() or path.parent.is_symlink():
+            raise Error("Invalid certificate record path.")
+        record = load(path)
+        try:
+            if record.get("id") != identifier or not isinstance(record.get("domains"), list):
+                raise ValueError
+            if normalize_domains(record["domains"]) != record["domains"]:
+                raise ValueError
+            if record.get("operation") not in (
+                "complete",
+                "failed",
+                "unknown",
+                "issuing",
+                "renewing",
+                "publishing",
+            ):
+                raise ValueError
+            if record.get("purpose", self.purpose) != self.purpose:
+                raise ValueError
+            if "issued" in record and type(record["issued"]) is not bool:
+                raise ValueError
+            automation = record.get("automation", {})
+            if not isinstance(automation, dict) or type(automation.get("enabled", False)) is not bool:
+                raise ValueError
+            if record.get("expires_at"):
+                expiry = dt.datetime.fromisoformat(record["expires_at"])
+                if expiry.tzinfo is None:
+                    raise ValueError
+            schedule = record.get("schedule", {})
+            if not isinstance(schedule, dict):
+                raise ValueError
+            if schedule:
+                if type(schedule.get("attempts")) is not int or not 0 <= schedule["attempts"] <= 3:
+                    raise ValueError
+                if not isinstance(schedule.get("attempt_id"), str) or not isinstance(
+                    schedule.get("day"), str
+                ):
+                    raise ValueError
+                if schedule.get("outcome") not in ("in progress", "done", "failed", "unknown"):
+                    raise ValueError
+                if type(schedule.get("slot", -1)) is not int:
+                    raise ValueError
+            deliveries = record.get("deliveries", [])
+            if not isinstance(deliveries, list):
+                raise ValueError
+            for item in deliveries:
+                if not isinstance(item, dict) or not all(
+                    isinstance(item.get(k), str)
+                    for k in ("kind", "name", "directory", "host_directory", "status")
+                ):
+                    raise ValueError
+                checked_path(item["directory"])
+                checked_path(item["host_directory"])
+        except (ValueError, TypeError, AttributeError):
+            raise Error("Invalid certificate state; restore its private record before writing.") from None
+        return record
 
     def records(self):
         result = []
         for path in sorted((self.root / "certificates").glob("*/record.json")):
-            record = load(path)
-            record["active"] = (path.parent / "current" / "fullchain.pem").is_file()
-            # The pointer is authoritative if interruption happened after publication.
+            try:
+                record = self.read_record(path.parent.name)
+            except (Error, OSError):
+                print("Warning: unreadable certificate record: " + path.parent.name)
+                continue
+            current = path.parent / "current"
+            record["active"] = (current / "fullchain.pem").is_file()
+            record["file_status"] = "not issued"
             if record["active"]:
-                record.update(validate_pair(path.parent / "current", record["domains"], check_validity=False))
+                try:
+                    record.update(validate_pair(current, record["domains"], check_validity=False))
+                    record["file_status"] = "available"
+                except Error:
+                    record["file_status"] = "invalid"
             result.append(record)
         return result
 
     def issue(self, domains):
         domains = normalize_domains(domains)
         identifier = certificate_identifier(domains)
-        with locked(self.root):
+        with certificate_lock(self, identifier), locked(self.root):
             self.config()
             legacy = identifier.rsplit("--", 1)[1]
             folder = self.root / "certificates" / identifier
@@ -392,52 +531,472 @@ class Manager:
     def renew(self, identifier):
         if not re.fullmatch(CERTIFICATE_ID, identifier):
             raise Error("Invalid certificate selection.")
-        with locked(self.root):
+        with certificate_lock(self, identifier), locked(self.root):
             self.config()
-            folder = self.root / "certificates" / identifier
-            record = load(folder / "record.json")
-            # A failed first issuance can be retried without pretending a certificate already exists.
-            active = (folder / "current" / "fullchain.pem").is_file()
-            record = self._obtain(record, folder, renew=record.get("issued", False) or active)
+            record = self.read_record(identifier)
+            record = self._renew_locked(record)
         return refresh_deliveries(self, record) if self.purpose == "core" else record
 
-    def _obtain(self, record, folder, renew):
-        record["operation"] = "renewing" if renew else "issuing"
+    def _renew_locked(self, record):
+        if record["operation"] in ("unknown", "issuing", "renewing", "publishing"):
+            raise OutcomeUnknown("An unfinished operation requires reconciliation before another CA request.")
+        folder = self.root / "certificates" / record["id"]
+        active = (folder / "current" / "fullchain.pem").is_file()
+        return self._obtain(record, folder, renew=record.get("issued", False) or active)
+
+    def _obtain(self, record, folder, renew, source=None):
+        version_name = uuid.uuid4().hex
+        record.pop("acme_result", None)
+        record.update(
+            {
+                "operation": "renewing" if renew else "issuing",
+                "candidate": version_name,
+                "export_before": pair_digest(self.root / "acme-exports" / record["id"]),
+            }
+        )
         save(folder / "record.json", record)
         versions = private_dir(folder / "versions")
-        version = private_dir(versions / uuid.uuid4().hex)
+        version = private_dir(versions / version_name)
         link = folder / (".current-" + uuid.uuid4().hex)
-        print("Validating DNS and requesting the certificate. This can take several minutes...", flush=True)
+        print("Checking certificate renewal and validating files...", flush=True)
         try:
-            self.obtain(record, version, renew=renew)
+            if source is None:
+                self.obtain(record, version, renew=renew)
+            else:
+                for name in ("fullchain.pem", "key.pem"):
+                    shutil.copyfile(source / name, version / name)
             metadata = validate_pair(version, record["domains"])
-            for name in ("fullchain.pem", "key.pem"):
-                path = version / name
-                path.chmod(0o600)
-                with path.open("rb") as stream:
-                    os.fsync(stream.fileno())
-            sync_dir(version)
-            sync_dir(versions)
-            record.update({"operation": "publishing", "candidate": version.name})
-            save(folder / "record.json", record)
-            link.symlink_to(Path("versions") / version.name)
-            os.replace(link, folder / "current")
-            sync_dir(folder)
-            record.update(metadata)
-            record.update({"operation": "complete", "issued": True})
+            if pair_digest(folder / "current") == pair_digest(version):
+                shutil.rmtree(version)
+                record.update(metadata)
+                record.update({"operation": "complete", "issued": True, "result": "unchanged"})
+            else:
+                for name in ("fullchain.pem", "key.pem"):
+                    path = version / name
+                    path.chmod(0o600)
+                    with path.open("rb") as stream:
+                        os.fsync(stream.fileno())
+                sync_dir(version)
+                sync_dir(versions)
+                record["operation"] = "publishing"
+                save(folder / "record.json", record)
+                link.symlink_to(Path("versions") / version.name)
+                os.replace(link, folder / "current")
+                sync_dir(folder)
+                record.update(metadata)
+                record.update({"operation": "complete", "issued": True, "result": "changed"})
             record.pop("candidate", None)
+            record.pop("export_before", None)
             save(folder / "record.json", record)
             return record
-        except BaseException:
-            # Preserve a published version even if the final state write was interrupted.
-            if (folder / "current").resolve() != version:
+        except BaseException as error:
+            published = (folder / "current").resolve() == version
+            uncertain = (
+                published
+                or record.get("acme_result") in ("not due", "client completed")
+                or isinstance(error, (OutcomeUnknown, KeyboardInterrupt, SystemExit))
+            )
+            if not uncertain:
                 shutil.rmtree(version, ignore_errors=True)
-            record["operation"] = "failed"
+                record.pop("candidate", None)
+            record["operation"] = "unknown" if uncertain else "failed"
             save(folder / "record.json", record)
             raise
         finally:
             link.unlink(missing_ok=True)
-            self.harden()
+
+    def reconcile(self, identifier):
+        """Recover validated output only. Never call the CA or replay a service action."""
+        with certificate_lock(self, identifier), locked(self.root):
+            record = self.read_record(identifier)
+            folder = self.root / "certificates" / identifier
+            if record["operation"] == "complete" and record.get("issued"):
+                validate_pair(folder / "current", record["domains"])
+                if record.get("schedule", {}).get("outcome") in ("unknown", "in progress"):
+                    record["schedule"]["outcome"] = "done"
+                    save(folder / "record.json", record)
+                return record
+            name = record.get("candidate", "")
+            candidate = folder / "versions" / name
+            if not re.fullmatch(r"[a-f0-9]{32}", name):
+                raise OutcomeUnknown("No recoverable candidate; operator review required.")
+            if candidate.is_symlink():
+                raise Error("Invalid recovery candidate.")
+            try:
+                validate_pair(candidate, record["domains"])
+            except Error:
+                export = self.root / "acme-exports" / identifier
+                if pair_digest(export) is None or pair_digest(export) == record.get("export_before"):
+                    raise OutcomeUnknown("No new validated ACME export; outcome remains unknown.") from None
+                validate_pair(export, record["domains"])
+                candidate = export
+            if candidate == (folder / "current").resolve():
+                record.update(validate_pair(candidate, record["domains"]))
+                record.update({"operation": "complete", "issued": True, "result": "changed"})
+                record.pop("candidate", None)
+                record.pop("export_before", None)
+                save(folder / "record.json", record)
+            else:
+                old_candidate = folder / "versions" / name
+                record = self._obtain(record, folder, renew=True, source=candidate)
+                if old_candidate != (folder / "current").resolve():
+                    shutil.rmtree(old_candidate, ignore_errors=True)
+            if record.get("schedule", {}).get("outcome") in ("unknown", "in progress"):
+                record["schedule"]["outcome"] = "done"
+                save(folder / "record.json", record)
+        return refresh_deliveries(self, record) if self.purpose == "core" else record
+
+
+def require_systemd():
+    if sys.platform != "linux" or os.geteuid() != 0 or not Path("/run/systemd/system").is_dir():
+        raise Error("Automatic renewal requires root on the Linux mother with systemd.")
+    try:
+        ZoneInfo("Asia/Tehran")
+    except ZoneInfoNotFoundError:
+        raise Error("Install system timezone data before enabling automatic renewal.") from None
+
+
+def unit_argument(value):
+    value = str(value)
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise Error("Control characters are not allowed in timer paths.")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
+
+
+def automation_units(script, state):
+    service = (
+        "[Unit]\nDescription=Simple Cert file renewal (manual activation)\nWants=network-online.target\nAfter=network-online.target\n\n"
+        "[Service]\nType=oneshot\nUser=root\nUMask=0077\nTimeoutStartSec=infinity\nKillMode=control-group\n"
+        f"ExecStart=/usr/bin/python3 {unit_argument(script)} --state-dir {unit_argument(state)} --worker\n"
+    )
+    timer = (
+        "[Unit]\nDescription=Simple Cert daily file renewal\n\n[Timer]\n"
+        "OnCalendar=*-*-* 04:00,10,20:00 Asia/Tehran\nPersistent=false\nAccuracySec=1s\n"
+        "Unit=simple-cert-renew.service\n\n[Install]\nWantedBy=timers.target\n"
+    )
+    return {"simple-cert-renew.service": service, "simple-cert-renew.timer": timer}
+
+
+def write_unit(path, text):
+    fd, temporary = tempfile.mkstemp(prefix=".simple-cert-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        Path(temporary).chmod(0o644)
+        os.replace(temporary, path)
+        sync_dir(path.parent)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def automation_owner():
+    path = AUTOMATION_DIR / "automation.json"
+    return load(path) if path.exists() else None
+
+
+def install_automation(manager):
+    require_systemd()
+    installation = identify_installation(Path(__file__))
+    if installation is None:
+        raise Error("Enable automation from a recognized installed copy.")
+    script = str(installation["script"])
+    state = str(manager.settings_root.resolve())
+    units = automation_units(script, state)
+    with locked(AUTOMATION_DIR), application_lock(installation["prefix"]):
+        owner = automation_owner()
+        if owner and (owner.get("script") != script or owner.get("state") != state):
+            raise Error("Automatic renewal belongs to another installation or state directory.")
+        for name, text in units.items():
+            path = SYSTEMD_DIR / name
+            if path.is_symlink() or (path.exists() and (not owner or path.read_text() != text)):
+                raise Error("An unrecognized renewal unit exists; no replacement performed.")
+        owner = {"script": script, "state": state, "status": "installing"}
+        save(AUTOMATION_DIR / "automation.json", owner)
+        for name, text in units.items():
+            write_unit(SYSTEMD_DIR / name, text)
+        run(["systemctl", "daemon-reload"], timeout=30)
+        run(["systemctl", "enable", "--now", "simple-cert-renew.timer"], timeout=30)
+        owner["status"] = "enabled"
+        save(AUTOMATION_DIR / "automation.json", owner)
+
+
+def remove_automation(installation):
+    owner = automation_owner()
+    if not owner or owner.get("script") != str(installation["script"]):
+        return
+    require_systemd()
+    with locked(AUTOMATION_DIR):
+        units = automation_units(owner["script"], owner["state"])
+        for name, text in units.items():
+            path = SYSTEMD_DIR / name
+            if path.is_symlink() or (path.exists() and path.read_text() != text):
+                raise Error("Renewal units changed; inspect before uninstalling.")
+        owner["status"] = "removing"
+        save(AUTOMATION_DIR / "automation.json", owner)
+        run(["systemctl", "disable", "--now", "simple-cert-renew.timer"], timeout=30)
+        run(["systemctl", "stop", "simple-cert-renew.service"], timeout=60)
+        for name in units:
+            (SYSTEMD_DIR / name).unlink(missing_ok=True)
+        sync_dir(SYSTEMD_DIR)
+        run(["systemctl", "daemon-reload"], timeout=30)
+        (AUTOMATION_DIR / "automation.json").unlink()
+        sync_dir(AUTOMATION_DIR)
+
+
+def set_automation(manager, identifier, enabled):
+    with certificate_lock(manager, identifier):
+        record = manager.read_record(identifier)
+        if enabled:
+            if record["operation"] != "complete" or not record.get("issued"):
+                raise Error("Complete or reconcile issuance before enabling automatic renewal.")
+            validate_pair(manager.root / "certificates" / identifier / "current", record["domains"])
+        record["automation"] = {"enabled": bool(enabled)}
+        save(manager.root / "certificates" / identifier / "record.json", record)
+    return record
+
+
+def enqueue_notice(root, key, message):
+    # Queue and acknowledgements are independent of certificate operation state.
+    with locked(root / "notices"):
+        path = root / "notifications.json"
+        queue = load(path) if path.exists() else {}
+        if key not in queue:
+            queue[key] = {"message": message, "sent": False}
+            save(path, queue)
+
+
+def configure_telegram(root, token, chat_id):
+    if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{8,200}", token) or not re.fullmatch(r"-?[0-9]{1,24}", chat_id):
+        raise Error("Enter a valid bot token and numeric Telegram chat ID.")
+    with locked(root / "notices"):
+        save(root / "telegram.json", {"token": token, "chat_id": chat_id})
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise Error("Redirect refused; private request suppressed.")
+
+
+def send_telegram(config, message):
+    if (
+        not isinstance(config.get("token"), str)
+        or not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{8,200}", config["token"])
+        or not isinstance(config.get("chat_id"), str)
+        or not re.fullmatch(r"-?[0-9]{1,24}", config["chat_id"])
+    ):
+        raise Error("Invalid saved Telegram settings; reconfigure using the hidden prompt.")
+    payload = json.dumps(
+        {"chat_id": config["chat_id"], "text": message, "disable_web_page_preview": True}
+    ).encode()
+    request = urllib.request.Request(
+        "https://api.telegram.org/bot" + config["token"] + "/sendMessage",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=15) as response:
+            result = json.loads(response.read(65537))
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            raise ValueError
+    except (OSError, ValueError, KeyError, urllib.error.URLError):
+        raise Error("Telegram delivery failed; private response suppressed.") from None
+
+
+def flush_notices(root):
+    path = root / "telegram.json"
+    if not path.exists():
+        return
+    with locked(root / "notices"):
+        config = load(path)
+        queue_path = root / "notifications.json"
+        queue = load(queue_path) if queue_path.exists() else {}
+        for event in queue.values():
+            if not event.get("sent"):
+                send_telegram(config, event["message"])
+                event["sent"] = True
+                save(queue_path, queue)
+
+
+def expiry_notice(manager, record, now):
+    if not record.get("expires_at"):
+        return
+    remaining = (dt.datetime.fromisoformat(record["expires_at"]) - now).total_seconds() / 86400
+    thresholds = [value for value in (7, 3, 1) if remaining <= value]
+    if thresholds:
+        threshold = min(thresholds)
+        key = f"expiry:{manager.purpose}:{record['id']}:{record['expires_at']}:{threshold}"
+        enqueue_notice(
+            manager.settings_root,
+            key,
+            f"{manager.purpose} certificate {', '.join(record['domains'])}: {max(0, int(remaining))} days remaining. Check renewal and manual activation.",
+        )
+
+
+def finish_schedule(manager, identifier, schedule, outcome):
+    with certificate_lock(manager, identifier):
+        record = manager.read_record(identifier)
+        if record.get("schedule", {}).get("attempt_id") != schedule["attempt_id"]:
+            raise Error("Scheduled operation identity changed; outcome not overwritten.")
+        record["schedule"]["outcome"] = outcome
+        save(manager.root / "certificates" / identifier / "record.json", record)
+    return record
+
+
+def worker_certificate(manager, identifier, local, now):
+    folder = manager.root / "certificates" / identifier
+    reconcile = False
+    checked = False
+    with certificate_lock(manager, identifier), locked(manager.root):
+        record = manager.read_record(identifier)
+        if record.get("automation", {}).get("enabled") is not True:
+            return
+        expiry_notice(manager, record, now)
+        old = record.get("schedule", {})
+        if not isinstance(old, dict):
+            raise Error("Invalid schedule state; automatic renewal blocked.")
+        if old.get("outcome") == "failed" and old.get("day") != local.date().isoformat():
+            enqueue_notice(
+                manager.settings_root,
+                f"failed:{manager.purpose}:{identifier}:{record.get('incident', old['attempt_id'])}",
+                f"{manager.purpose} certificate {identifier}: unresolved renewal failure from the previous window. Expires {record.get('expires_at', 'unknown')}; inspect local status.",
+            )
+        if old.get("outcome") in ("in progress", "unknown") or record["operation"] in (
+            "issuing",
+            "renewing",
+            "publishing",
+            "unknown",
+        ):
+            reconcile = True
+            schedule = old or {"attempt_id": uuid.uuid4().hex, "day": local.date().isoformat(), "attempts": 0}
+            record["schedule"] = {**schedule, "outcome": "unknown"}
+            save(folder / "record.json", record)
+        else:
+            same_day = old.get("day") == local.date().isoformat()
+            attempts = old.get("attempts", 0) if same_day else 0
+            slot = local.minute // 10
+            if type(attempts) is not int or not 0 <= attempts <= 3:
+                raise Error("Invalid attempt budget; automatic renewal blocked.")
+            if same_day and old.get("outcome") == "done":
+                checked = True
+                schedule = old
+            elif same_day and old.get("slot", -1) >= slot:
+                return
+            if not checked and attempts >= 3:
+                return
+            if not checked:
+                schedule = {
+                    "attempt_id": uuid.uuid4().hex,
+                    "day": local.date().isoformat(),
+                    "attempts": attempts + 1,
+                    "slot": slot,
+                    "outcome": "in progress",
+                }
+                record["schedule"] = schedule
+                save(folder / "record.json", record)
+                try:
+                    record = manager._renew_locked(record)
+                except BaseException as error:
+                    record = manager.read_record(identifier)
+                    outcome = (
+                        "unknown"
+                        if record["operation"] == "unknown"
+                        or isinstance(error, (OutcomeUnknown, KeyboardInterrupt, SystemExit))
+                        else "failed"
+                    )
+                    record["schedule"]["outcome"] = outcome
+                    record["incident"] = record.get("incident") or schedule["attempt_id"]
+                    save(folder / "record.json", record)
+                    if outcome == "unknown" or slot == 2 or attempts == 2:
+                        enqueue_notice(
+                            manager.settings_root,
+                            f"{outcome}:{manager.purpose}:{identifier}:{record['incident']}",
+                            f"{manager.purpose} certificate {', '.join(record['domains'])}: {outcome}; inspect local status. Existing files retained; manual activation required.",
+                        )
+                    raise
+    try:
+        if reconcile:
+            record = manager.reconcile(identifier)
+        if manager.purpose == "core":
+            record = refresh_deliveries(manager, record)
+    except BaseException:
+        finish_schedule(manager, identifier, schedule, "unknown")
+        enqueue_notice(
+            manager.settings_root,
+            f"unknown:{manager.purpose}:{identifier}:{schedule['attempt_id']}",
+            f"{manager.purpose} certificate {identifier}: recovery requires operator review; no new CA request made.",
+        )
+        raise
+    pending = any(item["status"] != "complete" for item in record.get("deliveries", []))
+    record = finish_schedule(manager, identifier, schedule, "done")
+    fingerprint = pair_digest(folder / "current")
+    if record.get("result") == "changed":
+        enqueue_notice(
+            manager.settings_root,
+            f"renewed:{manager.purpose}:{identifier}:{fingerprint}",
+            f"{manager.purpose} certificate {', '.join(record['domains'])}: renewed files. Expires {record.get('expires_at', 'unknown')}. Manual activation required.",
+        )
+    if pending:
+        enqueue_notice(
+            manager.settings_root,
+            f"delivery:{manager.purpose}:{identifier}:{fingerprint}",
+            f"{manager.purpose} certificate {identifier}: local files available; Delivery pending. Retry delivery from certificate details.",
+        )
+    if record.get("incident") and not pending:
+        enqueue_notice(
+            manager.settings_root,
+            f"recovered:{manager.purpose}:{identifier}:{record['incident']}",
+            f"{manager.purpose} certificate {identifier}: renewal recovered; manual activation required.",
+        )
+        with certificate_lock(manager, identifier):
+            record = manager.read_record(identifier)
+            record.pop("incident", None)
+            save(folder / "record.json", record)
+
+
+def worker(root, now=None):
+    root = Path(root).expanduser().absolute()
+    fixed_clock = now is not None
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None:
+        raise Error("Worker requires a timezone-aware clock.")
+    try:
+        local = now.astimezone(ZoneInfo("Asia/Tehran"))
+    except ZoneInfoNotFoundError:
+        raise Error("Asia/Tehran timezone data unavailable; automatic renewal blocked.") from None
+    try:
+        lock = locked(root / "worker")
+        lock.__enter__()
+    except Busy:
+        print("Worker already running; skipped.")
+        return 0
+    failed = False
+    try:
+        if local.hour == 4 and local.minute < 30:
+            for purpose in ("core", "panel"):
+                manager = Manager(root, purpose=purpose)
+                for record in manager.records():
+                    try:
+                        instant = now if fixed_clock else dt.datetime.now(dt.timezone.utc)
+                        current_local = instant.astimezone(ZoneInfo("Asia/Tehran"))
+                        if current_local.hour != 4 or current_local.minute >= 30:
+                            break
+                        worker_certificate(manager, record["id"], current_local, instant)
+                    except (Error, OSError):
+                        failed = True
+                        print(
+                            f"{purpose} certificate {record['id']}: automatic operation needs review; private output suppressed."
+                        )
+        try:
+            flush_notices(root)
+        except (Error, OSError):
+            failed = True
+            print("Telegram unavailable; notices retained for retry.")
+    finally:
+        lock.__exit__(None, None, None)
+    return int(failed)
 
 
 def docker_panels(containers):
@@ -483,16 +1042,23 @@ def docker_panels(containers):
 def discover_panels():
     """Inspect local Docker only; never expose inspect/environment output."""
     try:
-        endpoint = os.environ.get("DOCKER_HOST")
+        context = os.environ.get("DOCKER_CONTEXT")
+        endpoint = None if context else os.environ.get("DOCKER_HOST")
         if not endpoint:
-            contexts = json.loads(run(["docker", "context", "inspect"], timeout=15).stdout)
+            argv = ["docker", "context", "inspect"] + ([context] if context else [])
+            contexts = json.loads(run(argv, timeout=15).stdout)
             endpoint = contexts[0]["Endpoints"]["docker"]["Host"]
         if not endpoint.startswith("unix://"):
             return []
-        ids = run(["docker", "ps", "-q"], timeout=15).stdout.decode().split()
+        docker = ["docker", "--host", endpoint]
+        env = {k: v for k, v in os.environ.items() if k not in ("DOCKER_HOST", "DOCKER_CONTEXT")}
+        ids = run([*docker, "ps", "-q"], env=env, timeout=15).stdout.decode().split()
         if not ids:
             return []
-        return docker_panels(json.loads(run(["docker", "inspect", *ids], timeout=15).stdout))
+        targets = docker_panels(json.loads(run([*docker, "inspect", *ids], env=env, timeout=15).stdout))
+        for target in targets:
+            target["docker"] = docker
+        return targets
     except (Error, ValueError, KeyError, IndexError, TypeError):
         return []
 
@@ -653,7 +1219,7 @@ def renewal_command(command):
         if "--cron" not in args and not domain:
             return None
         home = str(Path(tokens[0]).parent) if Path(tokens[0]).is_absolute() else "/root/.acme.sh"
-        result = {"client": client, "home": option("--home", home)}
+        result = {"client": client, "home": option("--config-home", option("--home", home))}
         if domain:
             result["domain"] = domain
         return result
@@ -993,14 +1559,21 @@ def panel_location(target, directory):
     return host
 
 
+def panel_docker(target, args, **kwargs):
+    env = {k: v for k, v in os.environ.items() if k not in ("DOCKER_HOST", "DOCKER_CONTEXT")}
+    return run([*target.get("docker", ["docker"]), *args], env=env, **kwargs)
+
+
 def panel_reader_identity(target):
-    options = run(["docker", "info", "--format", "{{json .SecurityOptions}}"], timeout=15).stdout.decode()
+    options = panel_docker(
+        target, ["info", "--format", "{{json .SecurityOptions}}"], timeout=15
+    ).stdout.decode()
     if target["userns"] not in ("", "host") or "rootless" in options or "userns" in options:
         raise Error("Automatic delivery requires local rootful Docker without user namespace remapping.")
     output = (
-        run(
+        panel_docker(
+            target,
             [
-                "docker",
                 "exec",
                 target["id"],
                 "python3",
@@ -1025,9 +1598,9 @@ def panel_reader_check(target, host, directory):
     expected = " ".join(hashlib.sha256((host / name).read_bytes()).hexdigest() for name in names)
     script = "import hashlib,sys; print(' '.join(hashlib.sha256(open(p,'rb').read()).hexdigest() for p in sys.argv[1:]))"
     actual = (
-        run(
+        panel_docker(
+            target,
             [
-                "docker",
                 "exec",
                 target["id"],
                 "python3",
@@ -1072,9 +1645,9 @@ def publish_delivery(manager, record, target, directory):
     if host.is_relative_to(manager.root.resolve()) or manager.root.resolve().is_relative_to(host):
         raise Error("Panel delivery must be separate from the private certificate state directory.")
     uid, gid = panel_reader_identity(fresh)
-    with locked(manager.root):
+    with certificate_lock(manager, record["id"]):
         record_path = manager.root / "certificates" / record["id"] / "record.json"
-        record = load(record_path)
+        record = manager.read_record(record["id"])
         source = record_path.parent / "current"
         metadata = validate_pair(source, record["domains"])
         marker = host / ".simple-cert-delivery.json"
@@ -1111,9 +1684,17 @@ def publish_delivery(manager, record, target, directory):
             deliveries.append(delivery)
         elif delivery["host_directory"] != str(host):
             raise Error("Panel mount changed. Select a new delivery directory explicitly.")
-        delivery["status"] = "pending"
-        save(record_path, record)
+        if pair_digest(host / "current") == pair_digest(source):
+            panel_reader_check(fresh, host / "current", str(Path(directory) / "current"))
+            delivery.update(metadata)
+            delivery["status"] = "complete"
+            delivery.pop("candidate", None)
+            save(record_path, record)
+            return record
         version = uuid.uuid4().hex
+        delivery["status"] = "pending"
+        delivery["candidate"] = version
+        save(record_path, record)
         candidate = host / "versions" / version
         link = host / (".current-" + version)
         try:
@@ -1131,6 +1712,7 @@ def publish_delivery(manager, record, target, directory):
             finally:
                 Path(temporary).unlink(missing_ok=True)
             (host / "versions").mkdir(mode=0o711, exist_ok=True)
+            (host / "versions").chmod(0o711)
             candidate.mkdir(mode=0o700)
             os.chown(candidate, uid, gid)
             for name in ("fullchain.pem", "key.pem"):
@@ -1145,15 +1727,24 @@ def publish_delivery(manager, record, target, directory):
             panel_candidate = str(Path(directory) / "versions" / version)
             panel_reader_check(fresh, candidate, panel_candidate)
             sync_dir(candidate)
+            sync_dir(host / "versions")
             link.symlink_to(Path("versions") / version)
             os.replace(link, host / "current")
             sync_dir(host)
+            delivery["status"] = "published-unverified"
+            save(record_path, record)
             panel_reader_check(fresh, host / "current", str(Path(directory) / "current"))
             delivery.update(metadata)
             delivery["status"] = "complete"
+            delivery.pop("candidate", None)
             save(record_path, record)
             return record
         except (OSError, Error):
+            if (host / "current").is_symlink() and os.readlink(host / "current") == f"versions/{version}":
+                raise Error(
+                    "Panel files were published; reader verification is pending. "
+                    "Previous versions remain available. Retry from certificate details."
+                ) from None
             raise Error(
                 "Certificate remains saved locally. Panel delivery is pending; previous files are retained."
             ) from None
@@ -1166,12 +1757,13 @@ def refresh_deliveries(manager, record):
         try:
             record = publish_delivery(manager, record, delivery, delivery["directory"])
         except Error:
-            with locked(manager.root):
+            with certificate_lock(manager, record["id"]):
                 path = manager.root / "certificates" / record["id"] / "record.json"
-                record = load(path)
+                record = manager.read_record(record["id"])
                 for saved in record.get("deliveries", []):
                     if saved["directory"] == delivery["directory"] and saved["name"] == delivery["name"]:
-                        saved["status"] = "pending"
+                        if saved["status"] != "published-unverified":
+                            saved["status"] = "pending"
                 save(path, record)
             print("Local renewal succeeded; a panel delivery is pending. Retry from certificate details.")
     return record
@@ -1255,14 +1847,40 @@ def settings_menu(manager):
 
 def show(manager, record):
     folder = manager.root / "certificates" / record["id"] / "current"
+    file_status = "not issued"
+    if (folder / "fullchain.pem").is_file():
+        try:
+            record.update(validate_pair(folder, record["domains"], check_validity=False))
+            file_status = "available"
+        except Error:
+            file_status = "invalid"
     purpose = "Panel HTTPS" if manager.purpose == "panel" else "Node/config Core TLS"
     print("\nCertificate section: " + purpose)
     print("Domains: " + ", ".join(record["domains"]))
+    print("File status: " + file_status)
     print("Expires (UTC): " + record.get("expires_at", "not issued"))
     print("Last operation: " + record["operation"])
+    print("ACME result: " + record.get("acme_result", "not recorded"))
     if (folder / "fullchain.pem").is_file():
         print(f"Full chain: {folder / 'fullchain.pem'}\nPrivate key: {folder / 'key.pem'}")
         print("Separate certificate files only. Existing panel HTTPS and .env are unchanged.")
+    labels = {"unchanged": "Unchanged", "changed": "New files published; Manual activation required"}
+    print("Result: " + labels.get(record.get("result"), record.get("operation", "unknown")))
+    print("Automatic renewal: " + ("enabled" if record.get("automation", {}).get("enabled") else "disabled"))
+    if record.get("expires_at"):
+        remaining = (dt.datetime.fromisoformat(record["expires_at"]) - dt.datetime.now(dt.timezone.utc)).days
+        print(f"Days remaining: {remaining}")
+    versions = folder.parent / "versions"
+    count = len(list(versions.iterdir())) if versions.is_dir() else 0
+    size = sum(
+        path.stat().st_size for path in versions.rglob("*") if path.is_file() and not path.is_symlink()
+    )
+    print(f"Versions: {count} | Retained bytes: {size}")
+    if record.get("schedule"):
+        schedule = record["schedule"]
+        print(
+            f"Last automatic check: {schedule.get('day', 'unknown')} | {schedule.get('outcome', 'unknown')} | Attempts: {schedule.get('attempts', 0)}"
+        )
     for delivery in record.get("deliveries", []):
         print(f"Core file delivery via container {delivery['name']}: {delivery['status']}")
         print(f"Certificate file: {delivery['directory']}/current/fullchain.pem")
@@ -1306,21 +1924,45 @@ def display_file(manager, record, filename):
 def certificate_menu(manager, record):
     while True:
         interactive = clear_screen()
+        record = manager.read_record(record["id"])
         show(manager, record)
         print("\n1. View fullchain.pem\n2. View key.pem (private)")
         if manager.purpose == "core":
             print("3. Publish/change node/config Core paths")
-        print("0. Back to panel HTTPS menu" if manager.purpose == "panel" else "0. Back to main menu")
-        choice = input(
-            "Choose action [0-2]: " if manager.purpose == "panel" else "Choose action [0-3]: "
-        ).strip()
+        print("4. Renew manually\n5. Enable/disable automatic renewal\n6. Reconcile interrupted operation")
+        if manager.purpose == "core":
+            print("7. Retry registered deliveries (no CA request)")
+        print("0. Back to certificate list/menu")
+        choice = input("Choose certificate action: ").strip()
         if choice == "0":
             return
         try:
             if choice == "3" and manager.purpose == "core":
                 record = delivery_menu(manager, record)
+            elif choice == "4":
+                record = manager.renew(record["id"])
+                show(manager, record)
+            elif choice == "5":
+                enabled = not record.get("automation", {}).get("enabled", False)
+                print("Daily file checks: 04:00 Tehran; retries at 04:10 and 04:20.")
+                print("Services are activated manually. Some consumers may read changed files automatically.")
+                if (
+                    input(("Enable" if enabled else "Disable") + " automatic renewal? Type yes: ")
+                    .strip()
+                    .lower()
+                    == "yes"
+                ):
+                    if enabled:
+                        install_automation(manager)
+                    record = set_automation(manager, record["id"], enabled)
+            elif choice == "6":
+                record = manager.reconcile(record["id"])
+                show(manager, record)
+            elif choice == "7" and manager.purpose == "core":
+                record = refresh_deliveries(manager, record)
+                show(manager, record)
             elif choice not in ("1", "2"):
-                raise Error("Invalid file selection.")
+                raise Error("Invalid certificate action.")
             else:
                 display_file(manager, record, "fullchain.pem" if choice == "1" else "key.pem")
         except Error as error:
@@ -1418,6 +2060,7 @@ def remove_installation(installation):
         if current is None or current["sha256"] != installation["sha256"]:
             raise Error("The selected installation changed after discovery; it was not removed.")
         script = current["script"]
+        remove_automation(current)
         for command in installation["commands"]:
             if command.is_symlink() and command.resolve() == script:
                 command.unlink()
@@ -1521,37 +2164,37 @@ def update_menu(manager):
     return True
 
 
-def menu(manager):
+def section_menu(manager):
     status_report = None
     while True:
         interactive = clear_screen()
         panel_section = manager.purpose == "panel"
         if panel_section:
             if status_report is None:
-                status_report = show_panel_https_status()
-            else:
-                print(status_report)
-        print(PANEL_MENU if panel_section else MENU)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    status_report = show_panel_https_status()
+            print("Current HTTPS configuration (read-only; live TLS unverified):")
+            for line in (status_report or "").splitlines():
+                if line.startswith(
+                    (
+                        "Panel/container:",
+                        "Certificate state:",
+                        "Expires (UTC):",
+                        "Renewal evidence:",
+                        "No supported",
+                    )
+                ):
+                    print(line)
+        print(PANEL_MENU if panel_section else CORE_MENU)
         try:
-            choice = input("Choose [0-4]: " if panel_section else "Choose [0-7]: ").strip()
-            if panel_section and choice == "4":
+            choice = input("Choose [0-5]: " if panel_section else "Choose [0-3]: ").strip()
+            if panel_section and choice == "5":
                 status_report = None
                 continue
-            if panel_section and choice not in ("0", "1", "2", "3"):
-                raise Error("Invalid choice. Choose a number from 0 to 4.")
-            if choice == "0":
+            if panel_section and choice == "4":
+                print(status_report or "No current HTTPS report available.")
+            elif choice == "0":
                 return
-            if choice == "4":
-                settings_menu(manager)
-            elif choice == "5":
-                if update_menu(manager):
-                    return
-            elif choice == "6":
-                if uninstall_menu(manager):
-                    return
-            elif choice == "7":
-                menu(Manager(manager.settings_root, purpose="panel"))
-                continue
             elif choice == "1":
                 if not (manager.settings_root / "settings.json").exists():
                     settings_menu(manager)
@@ -1581,7 +2224,7 @@ def menu(manager):
                 else:
                     for index, record in enumerate(records, 1):
                         print(
-                            f"{index}. {', '.join(record['domains'])} | {record.get('expires_at', 'not issued')} | {record['operation']}"
+                            f"{index}. {', '.join(record['domains'])} | {record.get('expires_at', 'not issued')} | {record['operation']} | Files: {record.get('file_status', 'unknown')}"
                         )
                     selection = input("Certificate number (0 to cancel): ").strip()
                     if selection == "0":
@@ -1596,7 +2239,7 @@ def menu(manager):
                         print("The ACME client renews only when due; no forced renewal is performed.")
                         show(manager, manager.renew(selected["id"]))
             else:
-                print("Invalid choice. Choose a number from 0 to 7.")
+                print("Invalid choice. Choose an action shown in this menu.")
         except Error as error:
             print(f"\nError: {error}")
         except KeyboardInterrupt:
@@ -1614,6 +2257,119 @@ def menu(manager):
                 print()
 
 
+def hidden_value(prompt):
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise Error("Secret entry requires an interactive terminal.")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass(prompt).strip()
+        except getpass.GetPassWarning:
+            raise Error("A hidden prompt is unavailable; reopen a private SSH terminal.") from None
+
+
+def utility_menu(manager, maintenance=False):
+    while True:
+        interactive = clear_screen()
+        if maintenance:
+            print("\nPROGRAM MAINTENANCE\n1. Update simple-cert\n2. Uninstall simple-cert\n0. Back")
+        else:
+            print(
+                "\nSETTINGS AND AUTOMATION\n1. Cloudflare settings\n2. Telegram settings\n3. Automation status\n4. Retry queued notices\n5. Send Telegram test notice\n0. Back"
+            )
+        choice = input("Choose utility action: ").strip()
+        if choice == "0":
+            return False
+        try:
+            if maintenance and choice in ("1", "2"):
+                if update_menu(manager) if choice == "1" else uninstall_menu(manager):
+                    return True
+            elif not maintenance and choice == "1":
+                settings_menu(manager)
+            elif not maintenance and choice == "2":
+                token = hidden_value("Dedicated Telegram bot token (hidden): ")
+                chat = input("Telegram chat ID: ").strip()
+                configure_telegram(manager.settings_root, token, chat)
+                print("Telegram settings saved privately. No message sent.")
+            elif not maintenance and choice == "3":
+                owner = automation_owner()
+                print("Schedule: 04:00, 04:10, 04:20 Asia/Tehran; no missed-run catch-up.")
+                print("Timer registration: " + (owner.get("status", "unknown") if owner else "not installed"))
+                if owner:
+                    print("Registered state directory: " + owner["state"])
+                    try:
+                        enabled = run(
+                            ["systemctl", "is-enabled", "simple-cert-renew.timer"],
+                            allowed=(0, 1, 3, 4),
+                            timeout=5,
+                        )
+                        active = run(
+                            ["systemctl", "is-active", "simple-cert-renew.timer"],
+                            allowed=(0, 3, 4),
+                            timeout=5,
+                        )
+                        print("Timer enabled: " + ("yes" if enabled.returncode == 0 else "no"))
+                        print("Timer active: " + ("yes" if active.returncode == 0 else "no"))
+                    except Error:
+                        print("Live timer state: unknown")
+                for purpose in ("core", "panel"):
+                    section = Manager(manager.settings_root, purpose=purpose)
+                    for record in section.records():
+                        print(
+                            f"{purpose}: {record['id']} | automatic renewal: {record.get('automation', {}).get('enabled', False)} | {record.get('schedule', {}).get('outcome', 'not checked')}"
+                        )
+            elif not maintenance and choice == "4":
+                flush_notices(manager.settings_root)
+                print("Queued notice delivery attempted; missing Telegram settings leave notices queued.")
+            elif not maintenance and choice == "5":
+                if input("Send a test to the configured Telegram chat? Type yes: ").strip().lower() == "yes":
+                    send_telegram(
+                        load(manager.settings_root / "telegram.json"),
+                        "Simple Cert test notice. No certificate or service changed.",
+                    )
+                    print("Telegram accepted the test notice.")
+            else:
+                print("Invalid choice.")
+        except (Error, OSError):
+            print(
+                "Operation could not complete. Check configuration and permissions; private output suppressed."
+            )
+        if interactive:
+            input("Press Enter to return to the menu...")
+
+
+def menu(manager):
+    while True:
+        interactive = clear_screen()
+        print(MENU)
+        try:
+            choice = input("Choose [0-4]: ").strip()
+            if choice == "0":
+                return
+            if choice in ("1", "2"):
+                section_menu(Manager(manager.settings_root, purpose="core" if choice == "1" else "panel"))
+            elif choice in ("3", "4"):
+                if utility_menu(manager, maintenance=choice == "4"):
+                    return
+            else:
+                print("Invalid choice. Choose a number from 0 to 4.")
+                if interactive:
+                    input("Press Enter to return to the menu...")
+        except KeyboardInterrupt:
+            print("\nCancelled; inspect unfinished operations before retrying.")
+        except EOFError:
+            print("\nGoodbye.")
+            return
+        except Error as error:
+            print(f"Error: {error}")
+            if interactive:
+                input("Press Enter to return to the menu...")
+
+
+def terminate_operation(signum, frame):
+    raise SystemExit(128 + signum)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="simple-cert", description="Interactive Cloudflare DNS-01 certificate tool."
@@ -1625,10 +2381,35 @@ def main():
         default=Path.home() / ".local/share/simple-cert",
         help="Private state directory (default: ~/.local/share/simple-cert)",
     )
+    parser.add_argument(
+        "--worker", action="store_true", help="Noninteractive scheduled file renewal; no activation"
+    )
+    parser.add_argument(
+        "--reconcile", metavar="CERTIFICATE_ID", help="Recover saved output without contacting the CA"
+    )
+    parser.add_argument(
+        "--section", choices=("core", "panel"), default="core", help="Section for --reconcile"
+    )
     args = parser.parse_args()
     os.umask(0o077)
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, terminate_operation)
     try:
-        menu(Manager(args.state_dir))
+        if args.worker:
+            owner = automation_owner()
+            if (
+                not owner
+                or owner.get("script") != str(Path(__file__).resolve())
+                or owner.get("state") != str(args.state_dir.expanduser().resolve())
+            ):
+                raise Error("Worker registration does not match this installation and state directory.")
+            require_systemd()
+            return worker(args.state_dir)
+        manager = Manager(args.state_dir, purpose=args.section)
+        if args.reconcile:
+            show(manager, manager.reconcile(args.reconcile))
+        else:
+            menu(manager)
     except Error as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

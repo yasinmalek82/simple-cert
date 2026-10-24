@@ -5,8 +5,10 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -130,10 +132,19 @@ def test_issue_publishes_pair_and_lists_paths(manager):
     assert listed[0]["operation"] == "complete"
 
 
-def test_successful_renew_retains_previous_version(manager):
+def test_successful_renew_retains_previous_version(manager, tmp_path, monkeypatch):
     record = manager.issue(["example.com"])
     current = manager.root / "certificates" / record["id"] / "current"
     previous = current.resolve()
+    fresh_root = tmp_path / "fresh"
+    fresh_root.mkdir()
+    fresh = pair.__wrapped__(fresh_root)
+
+    def new_pair(record, destination, renew=False):
+        for name in ("fullchain.pem", "key.pem"):
+            shutil.copyfile(fresh / name, destination / name)
+
+    monkeypatch.setattr(manager, "obtain", new_pair)
     manager.renew(record["id"])
     assert current.resolve() != previous
     assert (previous / "key.pem").is_file()
@@ -168,6 +179,25 @@ def test_bad_candidate_never_replaces_existing_pair(manager, app, monkeypatch):
     with pytest.raises(app.Error):
         manager.renew(record["id"])
     assert current.resolve() == previous
+
+
+@pytest.mark.parametrize("days", [90, -2])
+def test_expired_or_future_candidate_never_replaces_existing_pair(manager, app, monkeypatch, days):
+    record = manager.issue(["example.com"])
+    current = manager.root / "certificates" / record["id"] / "current"
+    previous = current.resolve()
+    original = (current / "fullchain.pem").read_bytes()
+
+    class ShiftedDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return super().now(tz) + dt.timedelta(days=days)
+
+    monkeypatch.setattr(app.dt, "datetime", ShiftedDateTime)
+    with pytest.raises(app.Error, match="expired or not yet valid"):
+        manager.renew(record["id"])
+    assert current.resolve() == previous
+    assert (current / "fullchain.pem").read_bytes() == original
 
 
 def test_acme_environment_and_arguments_do_not_expose_token(app, tmp_path, monkeypatch, pair):
@@ -207,10 +237,50 @@ def test_command_failure_never_leaks_raw_output(app):
     assert "secret-token" not in str(error.value)
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+def test_command_timeout_or_cancel_stops_descendants_before_returning(app, tmp_path, cancel):
+    marker = tmp_path / "unexpected-write"
+    ready = tmp_path / "ready"
+    child = (
+        "import time; from pathlib import Path; "
+        f"Path({str(ready)!r}).touch(); time.sleep(1.0); Path({str(marker)!r}).touch()"
+    )
+    parent = f"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',{child!r}]); time.sleep(30)"
+    # Run the real command wrapper in a separate process; a signal tests actual
+    # cancellation rather than substituting communicate() or subprocess itself.
+    harness = (
+        "import importlib.util,sys; "
+        f"s=importlib.util.spec_from_file_location('app',{str(SCRIPT)!r}); "
+        "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+        f"m.run([sys.executable,'-c',{parent!r}],timeout={30 if cancel else 0.4})"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", harness], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "Fixture child did not start"
+        if cancel:
+            process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode != 0
+        assert b"private command output" not in stdout
+        if not cancel:
+            assert b"timed out" in stderr
+        time.sleep(1.1)
+        assert not marker.exists(), "A descendant continued writing after cancellation/timeout"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
 def test_menu_handles_invalid_choice_and_exits(app, tmp_path, monkeypatch, capsys):
     values = iter(["invalid", "2", "0"])
     monkeypatch.setattr("builtins.input", lambda _: next(values))
-    app.menu(app.Manager(tmp_path / "state"))
+    app.section_menu(app.Manager(tmp_path / "state"))
     output = capsys.readouterr().out
     assert "Invalid choice" in output
     assert "No certificates" in output
@@ -240,6 +310,34 @@ def test_settings_require_terminal(app, tmp_path, monkeypatch):
 def test_missing_settings_fail_before_network(app, tmp_path):
     with pytest.raises(app.Error, match="settings"):
         app.Manager(tmp_path / "state").issue(["example.com"])
+
+
+def test_interrupted_engine_preparation_can_be_retried(app, tmp_path, monkeypatch):
+    tool = app.Manager(tmp_path / "state")
+
+    def git(argv, **kwargs):
+        if argv[:2] == ["git", "init"]:
+            source = Path(argv[2])
+            source.mkdir(parents=True, exist_ok=True)
+            (source / "acme.sh").write_text("fixture engine, never executed")
+        output = app.ACME_COMMIT.encode() if "rev-parse" in argv else b""
+        return subprocess.CompletedProcess(argv, 0, output, b"")
+
+    monkeypatch.setattr(app, "run", git)
+    copytree = app.shutil.copytree
+
+    def interrupted(*args, **kwargs):
+        copytree(*args, **kwargs)
+        raise OSError("Fixture: interrupted engine copy")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(app.shutil, "copytree", interrupted)
+        with pytest.raises(OSError):
+            tool.install_engine()
+    assert not (tool.root / "engine").exists()
+    tool.install_engine()
+    assert (tool.root / "engine/acme.sh").is_file()
+    assert (tool.root / "engine/revision").read_text() == app.ACME_COMMIT
 
 
 def test_expired_certificate_can_be_listed_and_selected_for_renewal(manager, monkeypatch):
@@ -288,11 +386,12 @@ def test_acme_export_paths_never_point_to_published_versions(app, tmp_path, monk
     assert (active / "fullchain.pem").read_bytes() == (pair / "fullchain.pem").read_bytes()
 
 
-def test_interrupted_publication_uses_existing_certificate_for_renewal(manager, monkeypatch):
+def test_interrupted_publication_requires_reconcile_before_renewal(manager, app, monkeypatch):
     record = manager.issue(["example.com"])
     path = manager.root / "certificates" / record["id"] / "record.json"
     record.pop("issued")
     record["operation"] = "publishing"
+    record["candidate"] = (path.parent / "current").resolve().name
     path.write_text(json.dumps(record))
     obtain = manager.obtain
 
@@ -301,6 +400,9 @@ def test_interrupted_publication_uses_existing_certificate_for_renewal(manager, 
         return obtain(record, destination, renew=renew)
 
     monkeypatch.setattr(manager, "obtain", check_renew)
+    with pytest.raises(app.OutcomeUnknown):
+        manager.renew(record["id"])
+    manager.reconcile(record["id"])
     manager.renew(record["id"])
 
 
@@ -329,18 +431,18 @@ def test_interactive_menu_clears_and_keeps_results_until_enter(app, tmp_path, mo
         return next(values)
 
     monkeypatch.setattr("builtins.input", answer)
-    app.menu(app.Manager(tmp_path / "state"))
+    app.section_menu(app.Manager(tmp_path / "state"))
     output = capsys.readouterr().out
     assert output.startswith("\033[2J\033[H")
     assert output.count("\033[2J\033[H") == 3
     assert "No certificates" in output
     assert "Invalid choice" in output
     assert prompts == [
-        "Choose [0-7]: ",
+        "Choose [0-3]: ",
         "Press Enter to return to the menu...",
-        "Choose [0-7]: ",
+        "Choose [0-3]: ",
         "Press Enter to return to the menu...",
-        "Choose [0-7]: ",
+        "Choose [0-3]: ",
     ]
 
 
@@ -359,9 +461,9 @@ def test_redirected_or_dumb_menu_stays_plain_and_does_not_pause(
         return next(values)
 
     monkeypatch.setattr("builtins.input", answer)
-    app.menu(app.Manager(tmp_path / "state"))
+    app.section_menu(app.Manager(tmp_path / "state"))
     assert "\033" not in capsys.readouterr().out
-    assert prompts == ["Choose [0-7]: ", "Choose [0-7]: "]
+    assert prompts == ["Choose [0-3]: ", "Choose [0-3]: "]
 
 
 def test_interactive_error_is_readable_before_redraw(app, tmp_path, monkeypatch, capsys):
@@ -376,7 +478,7 @@ def test_interactive_error_is_readable_before_redraw(app, tmp_path, monkeypatch,
     monkeypatch.setattr(manager, "records", fail)
     values = iter(["2", "", "0"])
     monkeypatch.setattr("builtins.input", lambda _: next(values))
-    app.menu(manager)
+    app.section_menu(manager)
     output = capsys.readouterr().out
     assert "Error: Example safe failure" in output
     assert output.count("\033[2J\033[H") == 2
@@ -419,7 +521,7 @@ def test_list_selection_opens_certificate_viewer(manager, app, monkeypatch, caps
     capsys.readouterr()
     values = iter(["2", "1", "1", "0", "0"])
     monkeypatch.setattr("builtins.input", lambda _: next(values))
-    app.menu(manager)
+    app.section_menu(manager)
     assert "-----BEGIN CERTIFICATE-----" in capsys.readouterr().out
 
 
@@ -522,12 +624,21 @@ def test_new_delivery_path_retains_previous_managed_path(manager, app, panel):
     assert (data / "certs/second/current/key.pem").is_file()
 
 
-def test_renewal_refreshes_registered_delivery(manager, app, panel):
+def test_renewal_refreshes_registered_delivery(manager, app, panel, tmp_path, monkeypatch):
     target, data = panel
     record = manager.issue(["example.com"])
     app.publish_delivery(manager, record, target, "/panel-data/certs/selected")
     current = data / "certs/selected/current"
     previous = current.resolve()
+    fresh_root = tmp_path / "next"
+    fresh_root.mkdir()
+    fresh = pair.__wrapped__(fresh_root)
+
+    def changed(record, destination, renew=False):
+        for name in ("fullchain.pem", "key.pem"):
+            shutil.copyfile(fresh / name, destination / name)
+
+    monkeypatch.setattr(manager, "obtain", changed)
     result = manager.renew(record["id"])
     assert current.resolve() != previous
     assert previous.is_dir()
@@ -551,6 +662,42 @@ def test_failed_delivery_keeps_previous_pair_and_marks_pending(manager, app, pan
     assert result["deliveries"][0]["status"] == "pending"
 
 
+def test_post_publication_delivery_failure_reports_actual_pointer(manager, app, panel, monkeypatch, tmp_path):
+    target, data = panel
+    record = manager.issue(["example.com"])
+    directory = "/panel-data/certs/selected"
+    record = app.publish_delivery(manager, record, target, directory)
+    current = data / "certs/selected/current"
+    previous = current.resolve()
+    fresh_root = tmp_path / "new-pair"
+    fresh_root.mkdir()
+    fresh = pair.__wrapped__(fresh_root)
+
+    def changed(record, destination, renew=False):
+        for name in ("fullchain.pem", "key.pem"):
+            shutil.copyfile(fresh / name, destination / name)
+
+    monkeypatch.setattr(manager, "obtain", changed)
+    # Refresh only the private source; the old delivery is still active.
+    with app.certificate_lock(manager, record["id"]), app.locked(manager.root):
+        record = manager._renew_locked(manager.read_record(record["id"]))
+    check = app.panel_reader_check
+
+    def fail_final_check(target, host, directory):
+        if host.name == "current":
+            raise app.Error("Fixture: panel disappeared after publication")
+        return check(target, host, directory)
+
+    monkeypatch.setattr(app, "panel_reader_check", fail_final_check)
+    with pytest.raises(app.Error, match="published.*verification is pending"):
+        app.publish_delivery(manager, record, target, directory)
+    assert current.resolve() != previous
+    assert previous.is_dir()
+    saved = manager.records()[0]["deliveries"][0]
+    assert saved["status"] == "published-unverified"
+    assert saved["candidate"] == current.resolve().name
+
+
 def test_unmanaged_directory_and_symlink_are_never_overwritten(manager, app, panel):
     target, data = panel
     record = manager.issue(["example.com"])
@@ -572,7 +719,7 @@ def test_issue_menu_offers_panel_delivery_after_success(manager, app, panel, mon
     monkeypatch.setattr(app, "delivery_menu", lambda manager, record, targets: seen.append(record["id"]))
     values = iter(["1", "example.com", "", "y", "y", "0"])
     monkeypatch.setattr("builtins.input", lambda _: next(values))
-    app.menu(manager)
+    app.section_menu(manager)
     assert seen == [manager.records()[0]["id"]]
 
 
@@ -646,7 +793,8 @@ def test_legacy_hashed_folder_stays_renewable_and_blocks_duplicate_issue(manager
     previous = (old / "current").resolve()
     result = manager.renew(legacy)
     assert result["id"] == legacy
-    assert (old / "current").resolve() != previous
+    assert (old / "current").resolve() == previous
+    assert result["result"] == "unchanged"
     assert previous.is_dir()
     with pytest.raises(app.Error, match="already saved"):
         manager.issue(["example.com"])
@@ -746,7 +894,7 @@ def test_panel_https_menu_keeps_existing_env_and_certificates(manager, app, pair
     monkeypatch.setattr(app.Manager, "obtain", obtain)
     monkeypatch.setattr(app, "show_panel_https_status", lambda: None)
     monkeypatch.setattr(app, "clear_screen", lambda: False)
-    values = iter(["7", "1", "example.com", "", "y", "2", "1", "1", "0", "3", "1", "0", "0"])
+    values = iter(["2", "1", "example.com", "", "y", "2", "1", "1", "0", "3", "1", "0", "0"])
     monkeypatch.setattr("builtins.input", lambda _: next(values))
     app.menu(manager)
     panel_manager = app.Manager(manager.root, purpose="panel")
