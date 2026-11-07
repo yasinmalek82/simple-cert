@@ -2,14 +2,14 @@
 
 Get a Let's Encrypt certificate through Cloudflare DNS, even when your domain points to a different server.
 
-Version **0.1.10** adds opt-in scheduled file renewal. Installing or updating the program does
-not enroll certificates or enable a timer automatically.
+Version **0.1.11** adds certificate archiving and restoration. Automatic file renewal requires
+explicit enrollment per certificate.
 Activation of Core/node TLS and panel HTTPS remains manual. See [automation and recovery](AUTOMATION.md).
 
 **Quick install** — Ubuntu 22.04 or newer (including 26.04/26.10), or Debian 12/13, on the mother server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.10/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.11/install.sh | sudo bash
 ```
 
 Then open the interactive menu:
@@ -76,6 +76,15 @@ paths, and the latest operation/automatic-check result. Certificate details prov
 - Renew manually; unchanged PEMs keep their existing version and paths.
 - Enable/disable automatic renewal **for this certificate only**.
 - Reconcile an interrupted operation using local evidence before making another CA request.
+- Archive a certificate and disable its automatic renewal.
+
+To replace a wildcard with an exact-host certificate, issue the exact name and answer `n` to the
+wildcard prompt. Switch any services using the wildcard to the new files and verify the served
+certificate. Then open **2. List certificates and file paths**, select the wildcard record, and
+choose **8. Archive certificate**. Archiving retains the certificate, key, previous versions and
+delivery paths. The archived certificate remains valid until expiration or separate CA revocation.
+To restore it to the main list, open **6. Archived certificates**, select it, and choose
+**8. Restore certificate**. Automatic renewal requires explicit re-enrollment after restoration.
 
 Automatic renewal is disabled by default. Enabling a certificate explicitly installs/enables a
 root systemd timer for this recognized installation and state directory. It checks at 04:00
@@ -235,7 +244,8 @@ renewal publication. It does not run a production PasarGuard panel or issue real
 
 Choose **2. Panel HTTPS certificates** in the main menu for the website/dashboard certificate, separate from the
 certificates used for node/config Core TLS. This submenu supports **1: issue**, **2: list and
-view PEM files**, **3: manual renewal**, **4: detailed current HTTPS report**, **5: refresh status**, and **0: return**.
+view PEM files**, **3: manual renewal**, **4: detailed current HTTPS report**, **5: refresh status**,
+**6: archived certificates**, and **0: return**.
 Its files, ACME client state and certificate list are isolated under `<state>/panel-https/`. The Cloudflare account settings
 from **3. Settings and automation → 1. Cloudflare settings** are shared. You can use a different domain for the panel.
 

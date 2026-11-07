@@ -131,10 +131,11 @@ def test_update_checks_release_digest_then_replaces_same_prefix(app, installed, 
     script = installed / "lib/simple-cert/simple_cert.py"
     monkeypatch.setattr(app, "__file__", str(script))
     monkeypatch.setattr(app.os, "geteuid", lambda: 0)
+    release_tag = "v" + app.VERSION
     monkeypatch.setattr(app, "VERSION", "0.1.3")
     data = (ROOT / "installer.py").read_bytes()
     release = {
-        "tag_name": "v0.1.10",
+        "tag_name": release_tag,
         "draft": False,
         "prerelease": False,
         "assets": [{"name": "installer.py", "digest": "sha256:" + hashlib.sha256(data).hexdigest()}],

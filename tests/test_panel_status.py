@@ -125,7 +125,7 @@ def test_option_seven_shows_readonly_status_before_prompt(app, tmp_path, monkeyp
     values = iter(["2", "0", "0"])
 
     def answer(prompt):
-        if prompt == "Choose [0-5]: ":
+        if prompt == "Choose [0-6]: ":
             assert calls == ["status"]
         return next(values)
 

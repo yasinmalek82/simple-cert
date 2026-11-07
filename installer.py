@@ -17,8 +17,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "v0.1.10"
-SCRIPT_SHA256 = "0ce0dfaeb223bc153da410ddbb02e48a1cb9d64839ac3d784cc21af6fa3e6f22"
+VERSION = "v0.1.11"
+SCRIPT_SHA256 = "5a601974059a531d0087a59ad7b632e168219d8c49b15616c3b65a3a47fb065f"
 SOURCE_URL = f"https://raw.githubusercontent.com/yasinmalek82/simple-cert/{VERSION}/simple_cert.py"
 
 
@@ -91,7 +91,7 @@ def _install_file(source, prefix):
             timeout=30,
             check=False,
         )
-        if result.returncode or result.stdout.strip() != b"simple-cert 0.1.10":
+        if result.returncode or result.stdout.strip() != f"simple-cert {VERSION[1:]}".encode():
             raise InstallError("Downloaded program failed its version check. Existing installation retained.")
         metadata = {
             "application": "simple-cert",
@@ -155,7 +155,7 @@ def main():
             source = Path(directory) / "simple_cert.py"
             source.write_bytes(data)
             install_file(source, args.prefix.expanduser().absolute())
-        print("Installed simple-cert 0.1.10. Existing settings and certificates have been preserved.")
+        print(f"Installed simple-cert {VERSION[1:]}. Existing settings and certificates have been preserved.")
         print("Open the menu: sudo simple-cert")
         print("Run it on the mother server. Certificates are delivered as local files only.")
         return 0

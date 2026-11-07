@@ -30,9 +30,7 @@ def app():
     return module
 
 
-@pytest.fixture
-def pair(tmp_path):
-    folder = tmp_path / "fixture"
+def generate_pair(folder, domains):
     folder.mkdir()
     key = ec.generate_private_key(ec.SECP256R1())
     now = dt.datetime.now(dt.timezone.utc)
@@ -46,7 +44,7 @@ def pair(tmp_path):
         .not_valid_before(now - dt.timedelta(hours=1))
         .not_valid_after(now + dt.timedelta(days=60))
         .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName("example.com"), x509.DNSName("*.example.com")]),
+            x509.SubjectAlternativeName([x509.DNSName(domain) for domain in domains]),
             critical=False,
         )
         .sign(key, hashes.SHA256())
@@ -60,6 +58,11 @@ def pair(tmp_path):
         )
     )
     return folder
+
+
+@pytest.fixture
+def pair(tmp_path):
+    return generate_pair(tmp_path / "fixture", ("example.com", "*.example.com"))
 
 
 @pytest.mark.parametrize(
@@ -438,11 +441,11 @@ def test_interactive_menu_clears_and_keeps_results_until_enter(app, tmp_path, mo
     assert "No certificates" in output
     assert "Invalid choice" in output
     assert prompts == [
-        "Choose [0-3]: ",
+        "Choose [0-3, 6]: ",
         "Press Enter to return to the menu...",
-        "Choose [0-3]: ",
+        "Choose [0-3, 6]: ",
         "Press Enter to return to the menu...",
-        "Choose [0-3]: ",
+        "Choose [0-3, 6]: ",
     ]
 
 
@@ -463,7 +466,7 @@ def test_redirected_or_dumb_menu_stays_plain_and_does_not_pause(
     monkeypatch.setattr("builtins.input", answer)
     app.section_menu(app.Manager(tmp_path / "state"))
     assert "\033" not in capsys.readouterr().out
-    assert prompts == ["Choose [0-3]: ", "Choose [0-3]: "]
+    assert prompts == ["Choose [0-3, 6]: ", "Choose [0-3, 6]: "]
 
 
 def test_interactive_error_is_readable_before_redraw(app, tmp_path, monkeypatch, capsys):
@@ -472,7 +475,7 @@ def test_interactive_error_is_readable_before_redraw(app, tmp_path, monkeypatch,
     monkeypatch.setenv("TERM", "xterm")
     manager = app.Manager(tmp_path / "state")
 
-    def fail():
+    def fail(*, archived=False):
         raise app.Error("Example safe failure")
 
     monkeypatch.setattr(manager, "records", fail)
