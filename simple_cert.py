@@ -25,7 +25,7 @@ import warnings
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERSION = "0.1.11"
+VERSION = "0.1.12"
 REPOSITORY = "yasinmalek82/simple-cert"
 LEGACY_RELEASES = {
     "57f5f5b583dd558ac4f52d23eba9d425b03229e34f07a2227a6590c88fe504a1": "0.1.0",
@@ -221,6 +221,14 @@ def certificate_identifier(domains):
     digest = hashlib.sha256("\n".join(domains).encode()).hexdigest()[:24]
     label = domains[0].replace("*.", "wildcard.")[:200]
     return f"{label}--{digest}"
+
+
+def require_settled(record, action):
+    if record["operation"] not in ("complete", "failed") or record.get("schedule", {}).get("outcome") in (
+        "in progress",
+        "unknown",
+    ):
+        raise Error(f"Reconcile the unfinished certificate operation before {action}.")
 
 
 def require_unarchived(record):
@@ -544,14 +552,46 @@ class Manager:
     def set_archived(self, identifier, archived):
         with certificate_lock(self, identifier):
             record = self.read_record(identifier)
-            if archived and (
-                record["operation"] not in ("complete", "failed")
-                or record.get("schedule", {}).get("outcome") in ("in progress", "unknown")
-            ):
-                raise Error("Reconcile the unfinished certificate operation before archiving.")
+            if archived:
+                require_settled(record, "archiving")
             record["archived"] = archived
             record["automation"] = {"enabled": False}
             save(self.root / "certificates" / identifier / "record.json", record)
+
+    def delete(self, identifier):
+        parents = [self.root / name for name in ("certificates", "acme-certificates", "acme-exports")]
+        if any(path.is_symlink() for path in parents):
+            raise Error("Invalid private certificate directory.")
+        with certificate_lock(self, identifier), locked(self.root):
+            record = self.read_record(identifier)
+            require_settled(record, "deleting")
+            folder, *workspaces = [parent / identifier for parent in parents]
+            if any(path.is_symlink() for path in workspaces):
+                raise Error("Invalid private ACME workspace.")
+            record_path = folder / "record.json"
+            # If interrupted, keep the record in the archive so deletion can be retried
+            # without a renewal running against partially removed files.
+            record["archived"] = True
+            record["automation"] = {"enabled": False}
+            try:
+                save(record_path, record)
+                for workspace in workspaces:
+                    if workspace.exists():
+                        shutil.rmtree(workspace)
+                        sync_dir(workspace.parent)
+                for path in folder.iterdir():
+                    # Retain the lock inode for other processes and future issuance.
+                    if path.name in ("record.json", "operation.lock"):
+                        continue
+                    if path.is_dir() and not path.is_symlink():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+                sync_dir(folder)
+                record_path.unlink()
+                sync_dir(folder)
+            except OSError:
+                raise Error("Could not finish deletion. Check private state permissions and retry.") from None
 
     def renew(self, identifier):
         if not re.fullmatch(CERTIFICATE_ID, identifier):
@@ -1970,7 +2010,7 @@ def certificate_menu(manager, record):
             if manager.purpose == "core":
                 print("7. Retry registered deliveries (no CA request)")
             print("8. Archive certificate")
-        print("0. Back to certificate list/menu")
+        print("9. Delete certificate permanently\n0. Back to certificate list/menu")
         choice = input("Choose certificate action: ").strip()
         if choice == "0":
             return
@@ -1992,6 +2032,16 @@ def certificate_menu(manager, record):
                         input("Press Enter to return to the menu...")
                     return
                 print(f"{action} cancelled.")
+            elif choice == "9":
+                print("This deletes the local certificate, private key, versions and ACME workspace.")
+                print("Switch any services using these local paths first. Delivered copies are kept.")
+                if input("Permanently delete this certificate? Type delete: ").strip().lower() == "delete":
+                    manager.delete(record["id"])
+                    print("Certificate deleted.")
+                    if interactive:
+                        input("Press Enter to return to the menu...")
+                    return
+                print("Deletion cancelled.")
             elif archived:
                 raise Error("Restore the archived certificate to use other actions.")
             elif choice == "3" and manager.purpose == "core":

@@ -117,3 +117,72 @@ def test_archive_requires_confirmation_and_refuses_unfinished_operation(app, man
     before = path.read_bytes()
     assert "Reconcile the unfinished certificate operation" in archive("yes")
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("purpose", ["core", "panel"])
+@pytest.mark.parametrize("confirmation", ["", "delete"])
+def test_delete_removes_only_selected_managed_certificate(app, tmp_path, monkeypatch, purpose, confirmation):
+    state = tmp_path / "state"
+    section = app.Manager(state, purpose=purpose)
+    section.configure("admin@example.com", "fixture-token")
+    fixture = generate_pair(tmp_path / "exact", ("example.com",))
+
+    def export(record, destination, renew=False):
+        for filename in ("fullchain.pem", "key.pem"):
+            shutil.copyfile(fixture / filename, destination / filename)
+
+    monkeypatch.setattr(section, "obtain", export)
+    record = section.issue(["example.com"])
+    other = app.Manager(state, purpose="core" if purpose == "panel" else "panel")
+    monkeypatch.setattr(other, "obtain", export)
+    other.issue(["example.com"])
+    app.set_automation(section, record["id"], True)
+    if purpose == "panel":
+        section.set_archived(record["id"], True)
+    delivery = tmp_path / "delivered"
+    shutil.copytree(fixture, delivery)
+    record = section.read_record(record["id"])
+    record["deliveries"] = [
+        {
+            "kind": "systemd",
+            "name": "panel",
+            "directory": str(delivery),
+            "host_directory": str(delivery),
+            "status": "complete",
+        }
+    ]
+    folder = section.root / "certificates" / record["id"]
+    app.save(folder / "record.json", record)
+    workspaces = [section.root / kind / record["id"] for kind in ("acme-certificates", "acme-exports")]
+    for path in workspaces:
+        shutil.copytree(fixture, path)
+
+    answers = iter(["9", confirmation, "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers, "0"))
+    app.certificate_menu(section, record)
+
+    deleted = confirmation == "delete"
+    assert (folder / "record.json").exists() is not deleted
+    assert (folder / "current").is_symlink() is not deleted
+    assert (folder / "versions").exists() is not deleted
+    assert all(path.exists() is not deleted for path in workspaces)
+    assert (delivery / "key.pem").read_bytes() == (fixture / "key.pem").read_bytes()
+    assert other.records()[0]["active"]
+    assert section.config()["email"] == "admin@example.com"
+    if deleted:
+        assert section.issue(["example.com"])["operation"] == "complete"
+
+
+def test_delete_refuses_unfinished_certificate(app, manager, monkeypatch, capsys):
+    record = manager.issue(["example.com", "*.example.com"])
+    record["operation"] = "unknown"
+    folder = manager.root / "certificates" / record["id"]
+    app.save(folder / "record.json", record)
+    answers = iter(["9", "delete", "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers, "0"))
+
+    app.certificate_menu(manager, record)
+
+    assert "Reconcile the unfinished certificate operation" in capsys.readouterr().out
+    assert (folder / "current/key.pem").is_file()
+    assert manager.read_record(record["id"])["operation"] == "unknown"

@@ -17,8 +17,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "v0.1.11"
-SCRIPT_SHA256 = "5a601974059a531d0087a59ad7b632e168219d8c49b15616c3b65a3a47fb065f"
+VERSION = "v0.1.12"
+SCRIPT_SHA256 = "7030c6af1a1cfeb84228e1e73337f93f073f5560040564a0661157727be85952"
 SOURCE_URL = f"https://raw.githubusercontent.com/yasinmalek82/simple-cert/{VERSION}/simple_cert.py"
 
 

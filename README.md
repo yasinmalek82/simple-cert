@@ -2,14 +2,14 @@
 
 Get a Let's Encrypt certificate through Cloudflare DNS, even when your domain points to a different server.
 
-Version **0.1.11** adds certificate archiving and restoration. Automatic file renewal requires
+Version **0.1.12** adds permanent deletion of individual certificates. Automatic file renewal requires
 explicit enrollment per certificate.
 Activation of Core/node TLS and panel HTTPS remains manual. See [automation and recovery](AUTOMATION.md).
 
 **Quick install** — Ubuntu 22.04 or newer (including 26.04/26.10), or Debian 12/13, on the mother server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.11/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.12/install.sh | sudo bash
 ```
 
 Then open the interactive menu:
@@ -77,6 +77,10 @@ paths, and the latest operation/automatic-check result. Certificate details prov
 - Enable/disable automatic renewal **for this certificate only**.
 - Reconcile an interrupted operation using local evidence before making another CA request.
 - Archive a certificate and disable its automatic renewal.
+- Permanently delete a certificate with **9. Delete certificate permanently** from either the
+  active or archived list. Type `delete` to remove its managed files, private key, previous
+  versions and ACME workspace, and stop renewal for that certificate. Move any services off
+  its local paths first. Delivered copies are kept and the certificate is not revoked by the CA.
 
 To replace a wildcard with an exact-host certificate, issue the exact name and answer `n` to the
 wildcard prompt. Switch any services using the wildcard to the new files and verify the served
