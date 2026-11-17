@@ -173,7 +173,7 @@ def test_delete_removes_only_selected_managed_certificate(app, tmp_path, monkeyp
         assert section.issue(["example.com"])["operation"] == "complete"
 
 
-def test_delete_refuses_unfinished_certificate(app, manager, monkeypatch, capsys):
+def test_normal_delete_does_not_discard_unfinished_certificate(app, manager, monkeypatch, capsys):
     record = manager.issue(["example.com", "*.example.com"])
     record["operation"] = "unknown"
     folder = manager.root / "certificates" / record["id"]
@@ -183,6 +183,37 @@ def test_delete_refuses_unfinished_certificate(app, manager, monkeypatch, capsys
 
     app.certificate_menu(manager, record)
 
-    assert "Reconcile the unfinished certificate operation" in capsys.readouterr().out
+    assert "Try option 6 to recover" in capsys.readouterr().out
     assert (folder / "current/key.pem").is_file()
     assert manager.read_record(record["id"])["operation"] == "unknown"
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_discard_interrupted_issuance_allows_retry_only_after_operation_unlocks(
+    app, manager, monkeypatch, capsys, busy
+):
+    domains = ["example.com", "*.example.com"]
+    obtain = manager.obtain
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(manager, "obtain", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.issue(domains)
+    monkeypatch.setattr(manager, "obtain", obtain)
+    record = manager.records()[0]
+    with pytest.raises(app.OutcomeUnknown, match="No new validated ACME export"):
+        manager.reconcile(record["id"])
+
+    answers = iter(["9", "discard", "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers, "0"))
+    if busy:
+        with app.certificate_lock(manager, record["id"]):
+            app.certificate_menu(manager, record)
+        assert "Another simple-cert operation is running" in capsys.readouterr().out
+        assert manager.read_record(record["id"])["operation"] == "unknown"
+    else:
+        app.certificate_menu(manager, record)
+        assert manager.records() == []
+        assert manager.issue(domains)["operation"] == "complete"

@@ -25,7 +25,7 @@ import warnings
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERSION = "0.1.12"
+VERSION = "0.1.13"
 REPOSITORY = "yasinmalek82/simple-cert"
 LEGACY_RELEASES = {
     "57f5f5b583dd558ac4f52d23eba9d425b03229e34f07a2227a6590c88fe504a1": "0.1.0",
@@ -223,11 +223,15 @@ def certificate_identifier(domains):
     return f"{label}--{digest}"
 
 
-def require_settled(record, action):
-    if record["operation"] not in ("complete", "failed") or record.get("schedule", {}).get("outcome") in (
+def operation_unfinished(record):
+    return record["operation"] not in ("complete", "failed") or record.get("schedule", {}).get("outcome") in (
         "in progress",
         "unknown",
-    ):
+    )
+
+
+def require_settled(record, action):
+    if operation_unfinished(record):
         raise Error(f"Reconcile the unfinished certificate operation before {action}.")
 
 
@@ -558,13 +562,14 @@ class Manager:
             record["automation"] = {"enabled": False}
             save(self.root / "certificates" / identifier / "record.json", record)
 
-    def delete(self, identifier):
+    def delete(self, identifier, *, discard_unfinished=False):
         parents = [self.root / name for name in ("certificates", "acme-certificates", "acme-exports")]
         if any(path.is_symlink() for path in parents):
             raise Error("Invalid private certificate directory.")
         with certificate_lock(self, identifier), locked(self.root):
             record = self.read_record(identifier)
-            require_settled(record, "deleting")
+            if not discard_unfinished:
+                require_settled(record, "deleting")
             folder, *workspaces = [parent / identifier for parent in parents]
             if any(path.is_symlink() for path in workspaces):
                 raise Error("Invalid private ACME workspace.")
@@ -2035,8 +2040,19 @@ def certificate_menu(manager, record):
             elif choice == "9":
                 print("This deletes the local certificate, private key, versions and ACME workspace.")
                 print("Switch any services using these local paths first. Delivered copies are kept.")
-                if input("Permanently delete this certificate? Type delete: ").strip().lower() == "delete":
-                    manager.delete(record["id"])
+                unfinished = operation_unfinished(record)
+                confirmation = "delete"
+                if unfinished:
+                    print("The last operation is unfinished. Try option 6 to recover any saved certificate.")
+                    print(
+                        "Discard locally if recovery fails. Check Cloudflare for leftover challenge records."
+                    )
+                    confirmation = "discard"
+                if (
+                    input(f"Permanently delete this certificate? Type {confirmation}: ").strip().lower()
+                    == confirmation
+                ):
+                    manager.delete(record["id"], discard_unfinished=unfinished)
                     print("Certificate deleted.")
                     if interactive:
                         input("Press Enter to return to the menu...")
