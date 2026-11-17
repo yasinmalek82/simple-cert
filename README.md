@@ -2,14 +2,14 @@
 
 Get a Let's Encrypt certificate through Cloudflare DNS, even when your domain points to a different server.
 
-Version **0.1.13** lets you discard an interrupted certificate operation when local recovery fails. Automatic file renewal requires
-explicit enrollment per certificate.
+Version **0.1.14** adds a **Needs attention** list, local recovery with an explicit retry for an interrupted
+first issuance, and resumable deletion. Automatic file renewal requires explicit enrollment per certificate.
 Activation of Core/node TLS and panel HTTPS remains manual. See [automation and recovery](AUTOMATION.md).
 
 **Quick install** — Ubuntu 22.04 or newer (including 26.04/26.10), or Debian 12/13, on the mother server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.13/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/yasinmalek82/simple-cert/v0.1.14/install.sh | sudo bash
 ```
 
 Then open the interactive menu:
@@ -67,27 +67,30 @@ control sequences or extra Enter prompts.
 0. Exit
 ```
 
-Each certificate section offers issuance, listing and manual renewal. Select a saved
-certificate to view expiry, days remaining, version count, retained bytes, source and delivery
-paths, and the latest operation/automatic-check result. Certificate details provide:
+Choose **2. Manage certificates** to see saved certificates or **7. Needs attention** to find
+failed requests, interrupted operations, incomplete deletions, expired or missing files and pending
+deliveries. Open a certificate to see its status, next action, expiry, local paths and delivery results.
+Certificate details provide:
 
 - View fullchain or private key (key display requires a terminal and explicit consent).
 - Publish/change Core delivery paths, or retry registered deliveries without contacting the CA.
 - Renew manually; unchanged PEMs keep their existing version and paths.
 - Enable/disable automatic renewal **for this certificate only**.
-- Reconcile an interrupted operation using local evidence before making another CA request.
+- Choose **6. Recover interrupted operation** to check for usable local files. If a first request
+  was interrupted and no recoverable files are found, type `retry` when prompted to issue again
+  for the same domains. For interrupted renewals, recovery keeps the existing publication until
+  a validated pair is ready.
 - Archive a certificate and disable its automatic renewal.
 - Permanently delete a certificate with **9. Delete certificate permanently** from either the
   active or archived list. Type `delete` to remove its managed files, private key, previous
   versions and ACME workspace, and stop renewal for that certificate. Move any services off
   its local paths first. Delivered copies are kept and the certificate is not revoked by the CA.
-  For an unfinished operation, try **6. Reconcile interrupted operation** first. If recovery
-  fails, use **9** and type `discard`, then issue the certificate again. Check Cloudflare
-  for any leftover challenge records from the interrupted attempt.
+  For an unfinished operation, **9** requires `discard`. If deletion itself is interrupted,
+  choose **7. Needs attention**, open the certificate and select **9. Resume deletion**.
 
 To replace a wildcard with an exact-host certificate, issue the exact name and answer `n` to the
 wildcard prompt. Switch any services using the wildcard to the new files and verify the served
-certificate. Then open **2. List certificates and file paths**, select the wildcard record, and
+certificate. Then open **2. Manage certificates**, select the wildcard record, and
 choose **8. Archive certificate**. Archiving retains the certificate, key, previous versions and
 delivery paths. The archived certificate remains valid until expiration or separate CA revocation.
 To restore it to the main list, open **6. Archived certificates**, select it, and choose
@@ -99,14 +102,14 @@ Asia/Tehran, with later retry opportunities at 04:10 and 04:20. The ACME client 
 renewal is due; no forced issuance is performed. Telegram settings are under **3. Settings and
 automation**. See [the operating contract](AUTOMATION.md) for failure and recovery details.
 
-For manual renewal, choose the section's **3. Renew certificate manually**, or **4. Renew manually**
-in certificate details. Failed initial issuance can be retried unless its outcome is unknown.
+For manual renewal, choose the section's **3. Renew or retry a certificate**, or **4. Renew now**
+in certificate details. A failed first issuance offers **4. Retry issuance**.
 Duplicate domain sets are directed to their existing record. The tool never calls the panel API,
 restarts/reloads a panel/node, or changes Core configuration. Some consumers may read updated
 files automatically; file publication cannot guarantee that a consumer waits for manual activation.
 
 To copy PEM contents, open the section's certificate list, select a certificate, and choose
-**View fullchain.pem** or **View key.pem**. Copy the complete PEM block, including BEGIN/END markers.
+**View certificate chain** or **View private key**. Copy the complete PEM block, including BEGIN/END markers.
 Private keys cannot be displayed through redirected output. Key display leaves the key in terminal
 scrollback: use a private, unrecorded session. Contents are never saved in application logs.
 
@@ -250,9 +253,8 @@ renewal publication. It does not run a production PasarGuard panel or issue real
 ## Panel HTTPS certificates: a separate section
 
 Choose **2. Panel HTTPS certificates** in the main menu for the website/dashboard certificate, separate from the
-certificates used for node/config Core TLS. This submenu supports **1: issue**, **2: list and
-view PEM files**, **3: manual renewal**, **4: detailed current HTTPS report**, **5: refresh status**,
-**6: archived certificates**, and **0: return**.
+certificates used for node/config Core TLS. Use **4. Inspect current panel HTTPS** for the report or
+**5. Refresh HTTPS inspection** to rescan. The submenu runs the inspection only when requested.
 Its files, ACME client state and certificate list are isolated under `<state>/panel-https/`. The Cloudflare account settings
 from **3. Settings and automation → 1. Cloudflare settings** are shared. You can use a different domain for the panel.
 
@@ -303,7 +305,7 @@ referenced by recognized jobs. Only direct clients and simple env/shell wrappers
 Custom scripts, unusual homes, other containers/users, global deploy hooks and incomplete access
 can prevent attribution. It does not execute renewal clients, hooks, inspected commands or services.
 The systemd scan is bounded and unavailable/partial inspection is indicated. Reports are cached
-while the submenu is open; choose **4** for the full report or **5** to refresh. Root is recommended for complete read access.
+while the submenu is open. Choose **4** for the full report or **5** to refresh. Root is recommended for complete read access.
 
 The current [official PasarGuard installer](https://github.com/PasarGuard/scripts/blob/main/pasarguard.sh)
 uses acme.sh for its Let's Encrypt setup, installs a cron renewal job and registers a reload hook.

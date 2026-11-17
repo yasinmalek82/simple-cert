@@ -187,3 +187,25 @@ def test_previous_failed_day_is_reported_before_next_daily_attempt(manager, app,
     app.worker(manager.settings_root, now=at() + dt.timedelta(days=1))
     queue = json.loads((manager.root / "notifications.json").read_text())
     assert any("unresolved renewal failure" in event["message"] for event in queue.values())
+
+
+def test_recovering_worker_checks_delivery_once(manager, app, monkeypatch, pair):
+    record = prepare(manager, app, monkeypatch, pair)
+    state = saved(manager, record)
+    state["schedule"] = {
+        "attempt_id": "interrupted",
+        "day": "2026-10-24",
+        "attempts": 1,
+        "outcome": "unknown",
+    }
+    app.save(manager.root / "certificates" / record["id"] / "record.json", state)
+    monkeypatch.setattr(app.Manager, "obtain", lambda *a, **k: pytest.fail("Must not contact the CA"))
+    delivered = []
+
+    def refresh(manager, record):
+        delivered.append(record["id"])
+        return record
+
+    monkeypatch.setattr(app, "refresh_deliveries", refresh)
+    assert app.worker(manager.root, now=at()) == 0
+    assert delivered == [record["id"]]

@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,7 @@ import warnings
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERSION = "0.1.13"
+VERSION = "0.1.14"
 REPOSITORY = "yasinmalek82/simple-cert"
 LEGACY_RELEASES = {
     "57f5f5b583dd558ac4f52d23eba9d425b03229e34f07a2227a6590c88fe504a1": "0.1.0",
@@ -50,20 +51,22 @@ MENU = f"""
 """
 CORE_MENU = """
   NODE/CONFIG CERTIFICATES
-  1. Issue certificate
-  2. List certificates and file paths
-  3. Renew certificate manually
+  1. Issue a certificate
+  2. Manage certificates
+  3. Renew or retry a certificate
   6. Archived certificates
+  7. Needs attention
   0. Back to main menu
 """
 PANEL_MENU = """
   PANEL HTTPS CERTIFICATES
-  1. Issue certificate
-  2. List certificates and file paths
-  3. Renew certificate manually
-  4. Detailed current HTTPS report
-  5. Refresh current HTTPS status
+  1. Issue a certificate
+  2. Manage certificates
+  3. Renew or retry a certificate
+  4. Inspect current panel HTTPS
+  5. Refresh HTTPS inspection
   6. Archived certificates
+  7. Needs attention
   0. Back to main menu
   Separate files only; activation is manual.
 """
@@ -79,6 +82,24 @@ class Busy(Error):
 
 class OutcomeUnknown(Error):
     """A side effect may have completed; inspect evidence before retrying."""
+
+
+class RecoveryUnavailable(OutcomeUnknown):
+    def __init__(self, message, *, can_retry=False):
+        super().__init__(message)
+        self.can_retry = can_retry
+
+
+class CertificateExists(Error):
+    def __init__(self, record):
+        self.record = record
+        if record.get("deletion_pending"):
+            message = "Deletion is incomplete. Use Resume deletion from Needs attention."
+        elif record.get("archived"):
+            message = "This certificate is archived. Restore it from Archived certificates."
+        else:
+            message = "This domain set is already saved. Open it from Manage certificates."
+        super().__init__(message)
 
 
 def run(argv, *, env=None, cwd=None, allowed=(0,), timeout=1800, message=None):
@@ -235,7 +256,13 @@ def require_settled(record, action):
         raise Error(f"Reconcile the unfinished certificate operation before {action}.")
 
 
+def require_not_deleting(record):
+    if record.get("deletion_pending"):
+        raise Error("Deletion is incomplete. Use Resume deletion from Needs attention.")
+
+
 def require_unarchived(record):
+    require_not_deleting(record)
     if record.get("archived"):
         raise Error("This certificate is archived. Restore it from Archived certificates first.")
 
@@ -476,7 +503,7 @@ class Manager:
                 raise ValueError
             if "issued" in record and type(record["issued"]) is not bool:
                 raise ValueError
-            if type(record.get("archived", False)) is not bool:
+            if any(type(record.get(flag, False)) is not bool for flag in ("archived", "deletion_pending")):
                 raise ValueError
             automation = record.get("automation", {})
             if not isinstance(automation, dict) or type(automation.get("enabled", False)) is not bool:
@@ -522,7 +549,7 @@ class Manager:
             except (Error, OSError):
                 print("Warning: unreadable certificate record: " + path.parent.name)
                 continue
-            if record.get("archived", False) != archived:
+            if archived is not None and record.get("archived", False) != archived:
                 continue
             current = path.parent / "current"
             record["active"] = (current / "fullchain.pem").is_file()
@@ -536,18 +563,24 @@ class Manager:
             result.append(record)
         return result
 
+    def find_certificate(self, domains):
+        identifier = certificate_identifier(domains)
+        legacy = identifier.rsplit("--", 1)[1]
+        for name in (identifier, legacy):
+            path = self.root / "certificates" / name / "record.json"
+            if path.exists() or path.is_symlink():
+                return self.read_record(name)
+        return None
+
     def issue(self, domains):
         domains = normalize_domains(domains)
         identifier = certificate_identifier(domains)
         with certificate_lock(self, identifier), locked(self.root):
+            existing = self.find_certificate(domains)
+            if existing is not None:
+                raise CertificateExists(existing)
             self.config()
-            legacy = identifier.rsplit("--", 1)[1]
             folder = self.root / "certificates" / identifier
-            path = folder / "record.json"
-            for existing in (path, self.root / "certificates" / legacy / "record.json"):
-                if existing.exists():
-                    require_unarchived(self.read_record(existing.parent.name))
-                    raise Error("This domain set is already saved. Use Renew certificate (menu option 3).")
             private_dir(folder)
             return self._obtain(
                 {"id": identifier, "domains": domains, "purpose": self.purpose}, folder, renew=False
@@ -556,26 +589,28 @@ class Manager:
     def set_archived(self, identifier, archived):
         with certificate_lock(self, identifier):
             record = self.read_record(identifier)
+            require_not_deleting(record)
             if archived:
                 require_settled(record, "archiving")
             record["archived"] = archived
             record["automation"] = {"enabled": False}
             save(self.root / "certificates" / identifier / "record.json", record)
 
-    def delete(self, identifier, *, discard_unfinished=False):
+    def delete(self, identifier, *, discard_unfinished=False, expected=None):
         parents = [self.root / name for name in ("certificates", "acme-certificates", "acme-exports")]
         if any(path.is_symlink() for path in parents):
             raise Error("Invalid private certificate directory.")
         with certificate_lock(self, identifier), locked(self.root):
             record = self.read_record(identifier)
-            if not discard_unfinished:
+            if expected is not None and record != expected:
+                raise Error("Certificate state changed. Review it before confirming deletion again.")
+            if not record.get("deletion_pending") and not discard_unfinished:
                 require_settled(record, "deleting")
             folder, *workspaces = [parent / identifier for parent in parents]
             if any(path.is_symlink() for path in workspaces):
                 raise Error("Invalid private ACME workspace.")
             record_path = folder / "record.json"
-            # If interrupted, keep the record in the archive so deletion can be retried
-            # without a renewal running against partially removed files.
+            record["deletion_pending"] = True
             record["archived"] = True
             record["automation"] = {"enabled": False}
             try:
@@ -596,49 +631,60 @@ class Manager:
                 record_path.unlink()
                 sync_dir(folder)
             except OSError:
-                raise Error("Could not finish deletion. Check private state permissions and retry.") from None
+                raise Error(
+                    "Could not finish deletion. Check permissions and use Resume deletion from Needs attention."
+                ) from None
 
     def renew(self, identifier):
         if not re.fullmatch(CERTIFICATE_ID, identifier):
             raise Error("Invalid certificate selection.")
         with certificate_lock(self, identifier), locked(self.root):
-            self.config()
             record = self.read_record(identifier)
+            require_unarchived(record)
+            if operation_unfinished(record):
+                raise OutcomeUnknown("Use Recover interrupted operation before another CA request.")
+            self.config()
             record = self._renew_locked(record)
         return refresh_deliveries(self, record) if self.purpose == "core" else record
 
     def _renew_locked(self, record):
         require_unarchived(record)
-        if record["operation"] in ("unknown", "issuing", "renewing", "publishing"):
-            raise OutcomeUnknown("An unfinished operation requires reconciliation before another CA request.")
         folder = self.root / "certificates" / record["id"]
         active = (folder / "current" / "fullchain.pem").is_file()
         return self._obtain(record, folder, renew=record.get("issued", False) or active)
 
     def _obtain(self, record, folder, renew, source=None):
-        version_name = uuid.uuid4().hex
-        record.pop("acme_result", None)
-        record.update(
-            {
-                "operation": "renewing" if renew else "issuing",
-                "candidate": version_name,
-                "export_before": pair_digest(self.root / "acme-exports" / record["id"]),
-            }
-        )
+        if source is None:
+            version_name = uuid.uuid4().hex
+            record.pop("acme_result", None)
+            record["operation"] = "renewing" if renew else "issuing"
+            record["export_before"] = pair_digest(self.root / "acme-exports" / record["id"])
+        else:
+            # Preserve recovery evidence if publication is interrupted again.
+            version_name = source.name if source.parent == folder / "versions" else uuid.uuid4().hex
+            record["operation"] = "publishing"
+        record["candidate"] = version_name
         save(folder / "record.json", record)
         versions = private_dir(folder / "versions")
         version = private_dir(versions / version_name)
         link = folder / (".current-" + uuid.uuid4().hex)
-        print("Checking certificate renewal and validating files...", flush=True)
+        print(
+            "Recovering local certificate files..."
+            if source is not None
+            else "Checking renewal with Let's Encrypt..."
+            if renew
+            else "Requesting a certificate from Let's Encrypt...",
+            flush=True,
+        )
         try:
             if source is None:
                 self.obtain(record, version, renew=renew)
-            else:
+            elif source != version:
                 for name in ("fullchain.pem", "key.pem"):
                     shutil.copyfile(source / name, version / name)
             metadata = validate_pair(version, record["domains"])
-            if pair_digest(folder / "current") == pair_digest(version):
-                shutil.rmtree(version)
+            unchanged = pair_digest(folder / "current") == pair_digest(version)
+            if unchanged:
                 record.update(metadata)
                 record.update({"operation": "complete", "issued": True, "result": "unchanged"})
             else:
@@ -659,11 +705,11 @@ class Manager:
             record.pop("candidate", None)
             record.pop("export_before", None)
             save(folder / "record.json", record)
-            return record
         except BaseException as error:
-            published = (folder / "current").resolve() == version
+            published = (folder / "current").resolve() == version.resolve()
             uncertain = (
                 published
+                or source is not None
                 or record.get("acme_result") in ("not due", "client completed")
                 or isinstance(error, (OutcomeUnknown, KeyboardInterrupt, SystemExit))
             )
@@ -673,46 +719,100 @@ class Manager:
             record["operation"] = "unknown" if uncertain else "failed"
             save(folder / "record.json", record)
             raise
+        else:
+            if unchanged:
+                shutil.rmtree(version, ignore_errors=True)
+            return record
         finally:
             link.unlink(missing_ok=True)
 
+    def _first_issuance(self, record, folder):
+        current = folder / "current"
+        return (
+            record["operation"] in ("unknown", "issuing", "publishing")
+            and not any(record.get(key) for key in ("issued", "expires_at", "deliveries", "schedule"))
+            and not record.get("automation", {}).get("enabled")
+            and not current.exists()
+            and not current.is_symlink()
+        )
+
+    def _recovery_source(self, record, folder):
+        name = record.get("candidate", "")
+        if not isinstance(name, str) or (name and not re.fullmatch(r"[a-f0-9]{32}", name)):
+            raise Error("Invalid recovery candidate. Inspect the private state before trying again.")
+        candidate = folder / "versions" / name if name else None
+        export = self.root / "acme-exports" / record["id"]
+        if shutil.which("openssl") is None:
+            raise Error("OpenSSL is required to check recovery files.")
+        if (folder / "versions").is_symlink() or export.parent.is_symlink():
+            raise Error("Invalid recovery directory.")
+        for source in (candidate, export):
+            if source is None:
+                continue
+            files = [source / filename for filename in ("fullchain.pem", "key.pem")]
+            if source.is_symlink():
+                raise Error("Invalid recovery file path.")
+            contents = []
+            for path in files:
+                try:
+                    info = path.lstat()
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+                        raise Error("Invalid recovery file path or size.")
+                    contents.append(path.read_bytes())
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    raise Error("Cannot read recovery files. Check private state permissions.") from None
+            if len(contents) != len(files):
+                continue
+            if source == export and hashlib.sha256(b"\0".join(contents)).hexdigest() == record.get(
+                "export_before"
+            ):
+                continue
+            try:
+                validate_pair(source, record["domains"])
+            except OutcomeUnknown:
+                raise
+            except Error:
+                continue
+            return source
+        return None
+
+    def retry_issuance(self, identifier, *, expected):
+        with certificate_lock(self, identifier), locked(self.root):
+            record = self.read_record(identifier)
+            require_unarchived(record)
+            folder = self.root / "certificates" / identifier
+            if record != expected or not self._first_issuance(record, folder):
+                raise Error("Certificate state changed or already has published files. Review its details.")
+            if self._recovery_source(record, folder) is not None:
+                raise Error("Recovery files are available. Run Recover interrupted operation again.")
+            self.config()
+            return self._obtain(record, folder, renew=False)
+
     def reconcile(self, identifier):
-        """Recover validated output only. Never call the CA or replay a service action."""
+        """Recover validated local files without making an ACME request."""
         with certificate_lock(self, identifier), locked(self.root):
             record = self.read_record(identifier)
             require_unarchived(record)
             folder = self.root / "certificates" / identifier
             if record["operation"] == "complete" and record.get("issued"):
                 validate_pair(folder / "current", record["domains"])
-                if record.get("schedule", {}).get("outcome") in ("unknown", "in progress"):
-                    record["schedule"]["outcome"] = "done"
-                    save(folder / "record.json", record)
-                return record
-            name = record.get("candidate", "")
-            candidate = folder / "versions" / name
-            if not re.fullmatch(r"[a-f0-9]{32}", name):
-                raise OutcomeUnknown("No recoverable candidate; operator review required.")
-            if candidate.is_symlink():
-                raise Error("Invalid recovery candidate.")
-            try:
-                validate_pair(candidate, record["domains"])
-            except Error:
-                export = self.root / "acme-exports" / identifier
-                if pair_digest(export) is None or pair_digest(export) == record.get("export_before"):
-                    raise OutcomeUnknown("No new validated ACME export; outcome remains unknown.") from None
-                validate_pair(export, record["domains"])
-                candidate = export
-            if candidate == (folder / "current").resolve():
-                record.update(validate_pair(candidate, record["domains"]))
-                record.update({"operation": "complete", "issued": True, "result": "changed"})
-                record.pop("candidate", None)
-                record.pop("export_before", None)
-                save(folder / "record.json", record)
             else:
-                old_candidate = folder / "versions" / name
-                record = self._obtain(record, folder, renew=True, source=candidate)
-                if old_candidate != (folder / "current").resolve():
-                    shutil.rmtree(old_candidate, ignore_errors=True)
+                source = self._recovery_source(record, folder)
+                if source is None:
+                    raise RecoveryUnavailable(
+                        "No new validated ACME export or prepared files. The outcome remains unknown.",
+                        can_retry=self._first_issuance(record, folder),
+                    )
+                if source.resolve() == (folder / "current").resolve():
+                    record.update(validate_pair(source, record["domains"]))
+                    record.update({"operation": "complete", "issued": True, "result": "changed"})
+                    record.pop("candidate", None)
+                    record.pop("export_before", None)
+                    save(folder / "record.json", record)
+                else:
+                    record = self._obtain(record, folder, renew=True, source=source)
             if record.get("schedule", {}).get("outcome") in ("unknown", "in progress"):
                 record["schedule"]["outcome"] = "done"
                 save(folder / "record.json", record)
@@ -817,14 +917,17 @@ def remove_automation(installation):
         sync_dir(AUTOMATION_DIR)
 
 
-def set_automation(manager, identifier, enabled):
+def set_automation(manager, identifier, enabled, *, register=False):
     with certificate_lock(manager, identifier):
         record = manager.read_record(identifier)
+        require_not_deleting(record)
         if enabled:
             require_unarchived(record)
-            if record["operation"] != "complete" or not record.get("issued"):
+            if operation_unfinished(record) or record["operation"] != "complete" or not record.get("issued"):
                 raise Error("Complete or reconcile issuance before enabling automatic renewal.")
             validate_pair(manager.root / "certificates" / identifier / "current", record["domains"])
+            if register:
+                install_automation(manager)
         record["automation"] = {"enabled": bool(enabled)}
         save(manager.root / "certificates" / identifier / "record.json", record)
     return record
@@ -924,7 +1027,11 @@ def worker_certificate(manager, identifier, local, now):
     checked = False
     with certificate_lock(manager, identifier), locked(manager.root):
         record = manager.read_record(identifier)
-        if record.get("archived") or record.get("automation", {}).get("enabled") is not True:
+        if (
+            record.get("deletion_pending")
+            or record.get("archived")
+            or record.get("automation", {}).get("enabled") is not True
+        ):
             return
         expiry_notice(manager, record, now)
         old = record.get("schedule", {})
@@ -936,12 +1043,7 @@ def worker_certificate(manager, identifier, local, now):
                 f"failed:{manager.purpose}:{identifier}:{record.get('incident', old['attempt_id'])}",
                 f"{manager.purpose} certificate {identifier}: unresolved renewal failure from the previous window. Expires {record.get('expires_at', 'unknown')}; inspect local status.",
             )
-        if old.get("outcome") in ("in progress", "unknown") or record["operation"] in (
-            "issuing",
-            "renewing",
-            "publishing",
-            "unknown",
-        ):
+        if operation_unfinished(record):
             reconcile = True
             schedule = old or {"attempt_id": uuid.uuid4().hex, "day": local.date().isoformat(), "attempts": 0}
             record["schedule"] = {**schedule, "outcome": "unknown"}
@@ -992,7 +1094,7 @@ def worker_certificate(manager, identifier, local, now):
     try:
         if reconcile:
             record = manager.reconcile(identifier)
-        if manager.purpose == "core":
+        elif manager.purpose == "core":
             record = refresh_deliveries(manager, record)
     except BaseException:
         finish_schedule(manager, identifier, schedule, "unknown")
@@ -1921,7 +2023,28 @@ def settings_menu(manager):
     print("Settings saved privately.")
 
 
+def certificate_status(record):
+    if record.get("deletion_pending"):
+        return "Deletion incomplete", "9. Resume deletion", True
+    if record.get("archived"):
+        return "Archived", "8. Restore certificate", False
+    if operation_unfinished(record):
+        return "Recovery needed", "6. Recover interrupted operation", True
+    if record["operation"] == "failed":
+        action = "Renew now" if record.get("issued") or record.get("active") else "Retry issuance"
+        return "Last request failed", f"4. {action}", True
+    if record.get("file_status") in ("not issued", "invalid") and record["operation"] == "complete":
+        return "Files need review", "4. Renew now or inspect the local paths", True
+    if any(item["status"] != "complete" for item in record.get("deliveries", [])):
+        return "Delivery pending", "7. Retry Core file delivery", True
+    expiry = record.get("expires_at")
+    if expiry and dt.datetime.fromisoformat(expiry) <= dt.datetime.now(dt.timezone.utc):
+        return "Expired", "4. Renew now", True
+    return "Ready", "Use the local paths or check whether renewal is due.", False
+
+
 def show(manager, record):
+    record = record.copy()
     folder = manager.root / "certificates" / record["id"] / "current"
     file_status = "not issued"
     if (folder / "fullchain.pem").is_file():
@@ -1931,15 +2054,18 @@ def show(manager, record):
         except Error:
             file_status = "invalid"
     purpose = "Panel HTTPS" if manager.purpose == "panel" else "Node/config Core TLS"
-    print("\nCertificate section: " + purpose)
+    record["file_status"] = file_status
+    status, next_step, _ = certificate_status(record)
+    print("\n" + purpose + " / Certificate details")
     print("Domains: " + ", ".join(record["domains"]))
+    print(f"Status: {status} | Expires (UTC): {record.get('expires_at', 'not issued')}")
+    print("Next: " + next_step)
     print("File status: " + file_status)
-    print("Expires (UTC): " + record.get("expires_at", "not issued"))
     print("Last operation: " + record["operation"])
     print("ACME result: " + record.get("acme_result", "not recorded"))
     if (folder / "fullchain.pem").is_file():
         print(f"Full chain: {folder / 'fullchain.pem'}\nPrivate key: {folder / 'key.pem'}")
-        print("Separate certificate files only. Existing panel HTTPS and .env are unchanged.")
+        print("Service activation: manual.")
     labels = {"unchanged": "Unchanged", "changed": "New files published; Manual activation required"}
     print("Result: " + labels.get(record.get("result"), record.get("operation", "unknown")))
     print("Automatic renewal: " + ("enabled" if record.get("automation", {}).get("enabled") else "disabled"))
@@ -1958,7 +2084,7 @@ def show(manager, record):
             f"Last automatic check: {schedule.get('day', 'unknown')} | {schedule.get('outcome', 'unknown')} | Attempts: {schedule.get('attempts', 0)}"
         )
     for delivery in record.get("deliveries", []):
-        print(f"Core file delivery via container {delivery['name']}: {delivery['status']}")
+        print(f"Core file delivery ({delivery['name']}): {delivery['status']}")
         print(f"Certificate file: {delivery['directory']}/current/fullchain.pem")
         print(f"Key file: {delivery['directory']}/current/key.pem")
 
@@ -1997,29 +2123,62 @@ def display_file(manager, record, filename):
     print(f"--- End of {filename} ---")
 
 
+def recover_menu(manager, record):
+    try:
+        recovered = manager.reconcile(record["id"])
+    except RecoveryUnavailable as error:
+        if not error.can_retry:
+            raise
+        print(error)
+        print("Retry issuance for the same domains. This may send a new request to Let's Encrypt.")
+        if input("Retry issuance? Type retry: ").strip().lower() != "retry":
+            print("Retry cancelled.")
+            return
+        recovered = manager.retry_issuance(record["id"], expected=record)
+    show(manager, recovered)
+
+
 def certificate_menu(manager, record):
     while True:
         interactive = clear_screen()
         record = manager.read_record(record["id"])
         show(manager, record)
         archived = record.get("archived", False)
-        if archived:
-            print("\n8. Restore certificate")
+        deleting = record.get("deletion_pending", False)
+        unfinished = operation_unfinished(record)
+        if deleting:
+            print("\n9. Resume deletion")
+        elif archived:
+            print("\n8. Restore certificate\n9. Delete certificate permanently")
         else:
-            print("\n1. View fullchain.pem\n2. View key.pem (private)")
-            if manager.purpose == "core":
-                print("3. Publish/change node/config Core paths")
+            print("\nActions")
+            if unfinished:
+                print("6. Recover interrupted operation")
+            else:
+                action = (
+                    "Retry issuance"
+                    if record["operation"] == "failed" and not record.get("issued")
+                    else "Renew now"
+                )
+                print(f"4. {action}")
             print(
-                "4. Renew manually\n5. Enable/disable automatic renewal\n6. Reconcile interrupted operation"
+                "5. "
+                + ("Disable" if record.get("automation", {}).get("enabled") else "Enable")
+                + " automatic renewal"
             )
+            if manager.purpose == "core" and record.get("deliveries"):
+                print("7. Retry Core file delivery")
+            print("\nFiles\n1. View certificate chain\n2. View private key")
             if manager.purpose == "core":
-                print("7. Retry registered deliveries (no CA request)")
-            print("8. Archive certificate")
-        print("9. Delete certificate permanently\n0. Back to certificate list/menu")
+                print("3. Publish files for PasarGuard Core")
+            print("\nMaintenance\n8. Archive certificate\n9. Delete certificate permanently")
+        print("0. Back")
         choice = input("Choose certificate action: ").strip()
         if choice == "0":
             return
         try:
+            if deleting and choice != "9":
+                require_not_deleting(record)
             if choice == "8":
                 if archived:
                     action = "Restore"
@@ -2040,10 +2199,12 @@ def certificate_menu(manager, record):
             elif choice == "9":
                 print("This deletes the local certificate, private key, versions and ACME workspace.")
                 print("Switch any services using these local paths first. Delivered copies are kept.")
-                unfinished = operation_unfinished(record)
                 confirmation = "delete"
-                if unfinished:
-                    print("The last operation is unfinished. Try option 6 to recover any saved certificate.")
+                if unfinished and not deleting:
+                    if not archived:
+                        print(
+                            "The last operation is unfinished. Try option 6 to recover any saved certificate."
+                        )
                     print(
                         "Discard locally if recovery fails. Check Cloudflare for leftover challenge records."
                     )
@@ -2052,7 +2213,9 @@ def certificate_menu(manager, record):
                     input(f"Permanently delete this certificate? Type {confirmation}: ").strip().lower()
                     == confirmation
                 ):
-                    manager.delete(record["id"], discard_unfinished=unfinished)
+                    manager.delete(
+                        record["id"], discard_unfinished=unfinished and not deleting, expected=record
+                    )
                     print("Certificate deleted.")
                     if interactive:
                         input("Press Enter to return to the menu...")
@@ -2063,8 +2226,10 @@ def certificate_menu(manager, record):
             elif choice == "3" and manager.purpose == "core":
                 record = delivery_menu(manager, record)
             elif choice == "4":
-                record = manager.renew(record["id"])
-                show(manager, record)
+                if unfinished:
+                    recover_menu(manager, record)
+                else:
+                    show(manager, manager.renew(record["id"]))
             elif choice == "5":
                 enabled = not record.get("automation", {}).get("enabled", False)
                 print("Daily file checks: 04:00 Tehran; retries at 04:10 and 04:20.")
@@ -2075,12 +2240,9 @@ def certificate_menu(manager, record):
                     .lower()
                     == "yes"
                 ):
-                    if enabled:
-                        install_automation(manager)
-                    record = set_automation(manager, record["id"], enabled)
+                    record = set_automation(manager, record["id"], enabled, register=True)
             elif choice == "6":
-                record = manager.reconcile(record["id"])
-                show(manager, record)
+                recover_menu(manager, record)
             elif choice == "7" and manager.purpose == "core":
                 record = refresh_deliveries(manager, record)
                 show(manager, record)
@@ -2090,6 +2252,10 @@ def certificate_menu(manager, record):
                 display_file(manager, record, "fullchain.pem" if choice == "1" else "key.pem")
         except Error as error:
             print(f"\nError: {error}")
+        except OSError:
+            print("\nCannot access private certificate files. Check permissions and disk space.")
+        except KeyboardInterrupt:
+            print("\nCancelled. Check the status below before trying again.")
         if interactive:
             input("Press Enter to return to certificate details...")
 
@@ -2292,35 +2458,18 @@ def section_menu(manager):
     while True:
         interactive = clear_screen()
         panel_section = manager.purpose == "panel"
-        if panel_section:
-            if status_report is None:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    status_report = show_panel_https_status()
-            print("Current HTTPS configuration (read-only; live TLS unverified):")
-            for line in (status_report or "").splitlines():
-                if line.startswith(
-                    (
-                        "Panel/container:",
-                        "Certificate state:",
-                        "Expires (UTC):",
-                        "Renewal evidence:",
-                        "No supported",
-                    )
-                ):
-                    print(line)
         print(PANEL_MENU if panel_section else CORE_MENU)
         try:
-            choice = input("Choose [0-6]: " if panel_section else "Choose [0-3, 6]: ").strip()
-            if panel_section and choice == "5":
-                status_report = None
-                continue
-            if panel_section and choice == "4":
+            choice = input("Choose [0-7]: " if panel_section else "Choose [0-3, 6-7]: ").strip()
+            if panel_section and choice in ("4", "5"):
+                if status_report is None or choice == "5":
+                    print("Inspecting panel HTTPS configuration and renewal schedules...", flush=True)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        status_report = show_panel_https_status()
                 print(status_report or "No current HTTPS report available.")
             elif choice == "0":
                 return
             elif choice == "1":
-                if not (manager.settings_root / "settings.json").exists():
-                    settings_menu(manager)
                 domain_prompt = (
                     "Panel HTTPS domain (example.com or *.example.com): "
                     if panel_section
@@ -2332,6 +2481,13 @@ def section_menu(manager):
                     and input("Include *." + domains[0] + " as well? [y/N]: ").strip().lower() == "y"
                 ):
                     domains.append("*." + domains[0])
+                existing = manager.find_certificate(domains)
+                if existing is not None:
+                    print(str(CertificateExists(existing)))
+                    certificate_menu(manager, existing)
+                    continue
+                if not (manager.settings_root / "settings.json").exists():
+                    settings_menu(manager)
                 print("DNS must be hosted on Cloudflare. No A/AAAA or proxy changes are required.")
                 if (
                     input("Issue a public Let's Encrypt certificate for these names? [y/N]: ").strip().lower()
@@ -2340,29 +2496,49 @@ def section_menu(manager):
                     issued = manager.issue(domains)
                     show(manager, issued)
                     offer_panel_delivery(manager, issued)
-            elif choice in ("2", "3", "6"):
-                records = manager.records(archived=choice == "6")
+            elif choice in ("2", "3", "6", "7"):
+                if choice == "7":
+                    records = [
+                        record for record in manager.records(archived=None) if certificate_status(record)[2]
+                    ]
+                else:
+                    records = manager.records(archived=choice == "6")
                 if not records:
-                    print("No archived certificates." if choice == "6" else "No certificates saved yet.")
+                    empty = {"6": "No archived certificates.", "7": "No certificates need attention."}
+                    print(empty.get(choice, "No certificates saved yet. Choose 1 to issue a certificate."))
                 else:
                     for index, record in enumerate(records, 1):
+                        status, _, _ = certificate_status(record)
                         print(
-                            f"{index}. {', '.join(record['domains'])} | {record.get('expires_at', 'not issued')} | {record['operation']} | Files: {record.get('file_status', 'unknown')}"
+                            f"{index}. {', '.join(record['domains'])} | {status} | Expires: {record.get('expires_at', 'not issued')}"
                         )
                     selection = input("Certificate number (0 to cancel): ").strip()
                     if selection == "0":
                         continue
-                    if not selection.isdigit() or not 1 <= int(selection) <= len(records):
+                    if (
+                        not selection.isascii()
+                        or not selection.isdigit()
+                        or len(selection) > len(str(len(records)))
+                        or not 1 <= int(selection) <= len(records)
+                    ):
                         raise Error("Invalid certificate number.")
                     selected = records[int(selection) - 1]
-                    if choice != "3":
+                    if choice == "3" and not (
+                        operation_unfinished(selected) or selected.get("deletion_pending")
+                    ):
+                        print("The ACME client renews only when due. A failed first issuance can be retried.")
+                        show(manager, manager.renew(selected["id"]))
+                    else:
                         certificate_menu(manager, selected)
                         continue
-                    else:
-                        print("The ACME client renews only when due; no forced renewal is performed.")
-                        show(manager, manager.renew(selected["id"]))
             else:
                 print("Invalid choice. Choose an action shown in this menu.")
+        except CertificateExists as error:
+            print(str(error))
+            certificate_menu(manager, error.record)
+            continue
+        except OSError:
+            print("\nCannot access local files or panel inspection. Check permissions and try again.")
         except Error as error:
             print(f"\nError: {error}")
         except KeyboardInterrupt:
@@ -2453,10 +2629,10 @@ def utility_menu(manager, maintenance=False):
                     print("Telegram accepted the test notice.")
             else:
                 print("Invalid choice.")
-        except (Error, OSError):
-            print(
-                "Operation could not complete. Check configuration and permissions; private output suppressed."
-            )
+        except Error as error:
+            print(f"\nError: {error}")
+        except OSError:
+            print("Cannot access local settings or installation files. Check permissions and try again.")
         if interactive:
             input("Press Enter to return to the menu...")
 

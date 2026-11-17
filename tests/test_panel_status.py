@@ -119,19 +119,14 @@ def test_status_handles_missing_files_without_guessing_public_url(app, installed
     assert status["public_url"] == "not confirmed"
 
 
-def test_option_seven_shows_readonly_status_before_prompt(app, tmp_path, monkeypatch, capsys):
+def test_opening_panel_menu_does_not_scan_system(app, tmp_path, monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(app, "show_panel_https_status", lambda: calls.append("status"))
     values = iter(["2", "0", "0"])
 
-    def answer(prompt):
-        if prompt == "Choose [0-6]: ":
-            assert calls == ["status"]
-        return next(values)
-
-    monkeypatch.setattr("builtins.input", answer)
+    monkeypatch.setattr("builtins.input", lambda _: next(values))
     app.menu(app.Manager(tmp_path / "state"))
-    assert calls == ["status"]
+    assert calls == []
 
 
 def test_echoed_command_and_domain_scoped_job_are_not_global_renewal_evidence(app, installed_panel):
@@ -264,7 +259,7 @@ def test_panel_status_refresh_is_explicit_and_menu_redraw_uses_cached_report(app
 
     monkeypatch.setattr(app, "show_panel_https_status", report)
     monkeypatch.setattr(app, "clear_screen", lambda: False)
-    values = iter(["2", "2", "5", "0", "0"])
+    values = iter(["2", "2", "4", "4", "5", "0", "0"])
     monkeypatch.setattr("builtins.input", lambda _: next(values))
     app.menu(app.Manager(tmp_path / "state"))
     assert calls == ["scan", "scan"]

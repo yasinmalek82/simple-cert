@@ -217,3 +217,155 @@ def test_discard_interrupted_issuance_allows_retry_only_after_operation_unlocks(
         app.certificate_menu(manager, record)
         assert manager.records() == []
         assert manager.issue(domains)["operation"] == "complete"
+
+
+@pytest.mark.parametrize("confirmation, expected_calls", [("", 1), ("retry", 2)])
+def test_recovery_menu_retries_first_issuance_with_same_record(
+    app, manager, monkeypatch, capsys, confirmation, expected_calls
+):
+    domains = ["example.com", "*.example.com"]
+    obtain = manager.obtain
+    calls = []
+
+    def interrupt_once(record, directory, renew=False):
+        calls.append((record["id"], list(record["domains"]), renew))
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        return obtain(record, directory, renew=renew)
+
+    monkeypatch.setattr(manager, "obtain", interrupt_once)
+    with pytest.raises(KeyboardInterrupt):
+        manager.issue(domains)
+    record = manager.records()[0]
+    answers = iter(["6", confirmation, "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers, "0"))
+    app.certificate_menu(manager, record)
+
+    assert calls == [(record["id"], domains, False)] * expected_calls
+    assert manager.read_record(record["id"])["operation"] == ("complete" if confirmation else "unknown")
+    assert "Retry issuance" in capsys.readouterr().out
+
+
+def test_retry_cannot_replace_published_certificate(app, manager, monkeypatch, capsys):
+    domains = ["example.com", "*.example.com"]
+    record = manager.issue(domains)
+    folder = manager.root / "certificates" / record["id"]
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(manager, "obtain", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.renew(record["id"])
+    original = (folder / "current").resolve()
+    answers = iter(["6", "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers, "0"))
+    app.certificate_menu(manager, record)
+    assert "Retry issuance" not in capsys.readouterr().out
+    assert (folder / "current").resolve() == original
+
+
+def test_interrupted_delete_cannot_be_restored_and_can_resume(app, manager, monkeypatch, capsys):
+    record = manager.issue(["example.com", "*.example.com"])
+    folder = manager.root / "certificates" / record["id"]
+    rmtree = shutil.rmtree
+
+    def fail(path, *args, **kwargs):
+        if path == folder / "versions":
+            raise PermissionError("fixture")
+        return rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", fail)
+    with pytest.raises(app.Error, match="Could not finish deletion"):
+        manager.delete(record["id"])
+    with pytest.raises(app.Error, match="deletion"):
+        manager.set_archived(record["id"], False)
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
+    answers = iter(["7", "1", "9", "delete", "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers, "0"))
+    app.section_menu(manager)
+
+    assert "Resume deletion" in capsys.readouterr().out
+    assert not (folder / "record.json").exists()
+
+
+def test_duplicate_issue_opens_existing_certificate_without_calling_ca(manager, app, monkeypatch, capsys):
+    domains = ["example.com", "*.example.com"]
+    record = manager.issue(domains)
+    monkeypatch.setattr(manager, "obtain", lambda *a, **k: pytest.fail("Duplicate must not contact CA"))
+    answers = iter(["1", "example.com", "y", "0", "0"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers, "0"))
+    app.section_menu(manager)
+    assert "Domains: example.com, *.example.com" in capsys.readouterr().out
+    assert manager.records()[0]["id"] == record["id"]
+
+
+@pytest.mark.parametrize("change", ["busy", "prepared"])
+def test_retry_confirmation_rechecks_lock_and_recovery_files(app, manager, monkeypatch, pair, change):
+    domains = ["example.com", "*.example.com"]
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(manager, "obtain", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.issue(domains)
+    record = manager.read_record(manager.records()[0]["id"])
+    with pytest.raises(app.RecoveryUnavailable) as failure:
+        manager.reconcile(record["id"])
+    assert failure.value.can_retry
+    monkeypatch.setattr(manager, "obtain", lambda *a, **k: pytest.fail("Must not contact the CA"))
+    if change == "busy":
+        with app.certificate_lock(manager, record["id"]), pytest.raises(app.Busy):
+            manager.retry_issuance(record["id"], expected=record)
+    else:
+        candidate = manager.root / "certificates" / record["id"] / "versions" / record["candidate"]
+        for name in ("fullchain.pem", "key.pem"):
+            shutil.copyfile(pair / name, candidate / name)
+        with pytest.raises(app.Error, match="Recovery files are available"):
+            manager.retry_issuance(record["id"], expected=record)
+        assert manager.reconcile(record["id"])["operation"] == "complete"
+
+
+def test_prepared_certificate_survives_interrupted_recovery(app, manager, monkeypatch):
+    obtain = manager.obtain
+
+    def interrupt_after_export(record, destination, renew=False):
+        obtain(record, destination, renew=renew)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(manager, "obtain", interrupt_after_export)
+    with pytest.raises(KeyboardInterrupt):
+        manager.issue(["example.com", "*.example.com"])
+    record = manager.records()[0]
+    folder = manager.root / "certificates" / record["id"]
+    replace = app.os.replace
+
+    def fail_pointer(source, destination):
+        if destination == folder / "current":
+            raise OSError("fixture")
+        return replace(source, destination)
+
+    monkeypatch.setattr(app.os, "replace", fail_pointer)
+    with pytest.raises(OSError, match="fixture"):
+        manager.reconcile(record["id"])
+    monkeypatch.setattr(app.os, "replace", replace)
+    monkeypatch.setattr(manager, "obtain", lambda *a, **k: pytest.fail("Must not contact the CA"))
+    assert manager.reconcile(record["id"])["operation"] == "complete"
+
+
+def test_recovery_keeps_published_candidate_with_aliased_state_parent(app, manager, tmp_path):
+    record = manager.issue(["example.com", "*.example.com"])
+    folder = manager.root / "certificates" / record["id"]
+    current = folder / "current"
+    version = current.resolve()
+    record["operation"] = "publishing"
+    record["candidate"] = version.name
+    app.save(folder / "record.json", record)
+    alias = tmp_path / "alias"
+    alias.symlink_to(manager.root.parent, target_is_directory=True)
+    aliased = app.Manager(alias / manager.root.name)
+
+    assert aliased.reconcile(record["id"])["operation"] == "complete"
+    assert current.resolve() == version
+    assert (current / "key.pem").is_file()

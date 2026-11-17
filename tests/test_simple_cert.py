@@ -441,11 +441,11 @@ def test_interactive_menu_clears_and_keeps_results_until_enter(app, tmp_path, mo
     assert "No certificates" in output
     assert "Invalid choice" in output
     assert prompts == [
-        "Choose [0-3, 6]: ",
+        "Choose [0-3, 6-7]: ",
         "Press Enter to return to the menu...",
-        "Choose [0-3, 6]: ",
+        "Choose [0-3, 6-7]: ",
         "Press Enter to return to the menu...",
-        "Choose [0-3, 6]: ",
+        "Choose [0-3, 6-7]: ",
     ]
 
 
@@ -466,7 +466,7 @@ def test_redirected_or_dumb_menu_stays_plain_and_does_not_pause(
     monkeypatch.setattr("builtins.input", answer)
     app.section_menu(app.Manager(tmp_path / "state"))
     assert "\033" not in capsys.readouterr().out
-    assert prompts == ["Choose [0-3, 6]: ", "Choose [0-3, 6]: "]
+    assert prompts == ["Choose [0-3, 6-7]: ", "Choose [0-3, 6-7]: "]
 
 
 def test_interactive_error_is_readable_before_redraw(app, tmp_path, monkeypatch, capsys):

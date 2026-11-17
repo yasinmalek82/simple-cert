@@ -1,6 +1,6 @@
 # Scheduled file renewal and recovery
 
-This is the operating contract for version 0.1.10. Local verification is not live CA,
+This is the operating contract for scheduled renewal. Local verification is not live CA,
 Linux service or node TLS acceptance. All operations run on the mother host. Management TLS,
 Core configuration, panel API, database access and service activation remain outside scope.
 
@@ -60,9 +60,12 @@ interrupted publication can leave `unknown`, `issuing`, `renewing` or `publishin
 block another CA call. Scheduled recovery first examines the saved candidate, current pointer and
 changed ACME export, validates the pair and finishes local publication when evidence is sufficient.
 An unchanged old export alone is insufficient evidence. If no validated candidate/export proves
-completion, the certificate stays on hold across days and a notice requests operator review.
+completion, scheduled renewal stays on hold and a notice requests operator review. In the
+interactive recovery menu, an interrupted first issuance with no published/delivered history can
+be retried explicitly with `retry`. The program checks the evidence again under lock before it
+sends a new CA request. Interrupted renewals continue to require evidence-based recovery.
 
-Certificate details action 6, or the following command, performs evidence-based recovery without
+Certificate details action 6 (**Recover interrupted operation**), or the following command, performs evidence-based recovery without
 contacting the CA or activating any service:
 
 ```bash
